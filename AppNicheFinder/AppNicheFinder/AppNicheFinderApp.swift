@@ -11,7 +11,7 @@ import SwiftUI
 struct AppNicheFinderApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            AppInfoView()
         }
     }
 }
