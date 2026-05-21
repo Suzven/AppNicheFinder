@@ -26,6 +26,7 @@ enum AppLookupError: LocalizedError {
 protocol AppLookupServicing {
     func fetchInfo(appID: String, country: String) async throws -> AppInfo
     func fetchBadReviews(appID: String, country: String, maxRating: Int, pages: Int) async throws -> [AppReview]
+    func fetchGoodReviews(appID: String, country: String, minRating: Int, limit: Int, pages: Int) async throws -> [AppReview]
 }
 
 // MARK: - Service (actor — thread-safe networking)
@@ -45,6 +46,33 @@ actor AppLookupService: AppLookupServicing {
         let (parsedSubtitle, parsedIAPs) = await pageData
 
         return makeAppInfo(from: result, subtitle: parsedSubtitle, iaps: parsedIAPs, country: country)
+    }
+
+    // MARK: - Good reviews (≥ minRating, до limit штук)
+    func fetchGoodReviews(appID: String, country: String = "us", minRating: Int = 4, limit: Int = 80, pages: Int = 10) async throws -> [AppReview] {
+        let cleanID = appID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanID.isEmpty, Int(cleanID) != nil else { throw AppLookupError.invalidAppID }
+        let pageRange = 1...min(max(pages, 1), 10)
+        let country = country.isEmpty ? "us" : country.lowercased()
+
+        var collected: [AppReview] = []
+        var seenIDs = Set<String>()
+        try await withThrowingTaskGroup(of: [AppReview].self) { group in
+            for page in pageRange {
+                group.addTask { [weak self] in
+                    guard let self else { return [] }
+                    return await self.fetchReviewsPage(appID: cleanID, country: country, page: page)
+                }
+            }
+            for try await pageReviews in group {
+                for review in pageReviews where !seenIDs.contains(review.id) {
+                    seenIDs.insert(review.id)
+                    collected.append(review)
+                }
+            }
+        }
+        let good = collected.filter { $0.rating >= minRating }
+        return Array(good.sorted { ($0.updated ?? .distantPast) > ($1.updated ?? .distantPast) }.prefix(limit))
     }
 
     // MARK: - Bad reviews (RSS feed, up to 10 pages, ~500 reviews max)

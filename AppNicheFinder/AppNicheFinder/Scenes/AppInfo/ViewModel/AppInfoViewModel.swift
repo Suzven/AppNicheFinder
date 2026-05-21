@@ -10,22 +10,21 @@ import SwiftUI
 @Observable
 final class AppInfoViewModel {
 
-    // MARK: - UI State
-    var appIDInput: String = ""
+    // MARK: - Input
+    /// Многострочный ввод: один ID на строку или через запятую/пробел.
+    var appIDsInput: String = ""
     var country: String = "us"
-    var info: AppInfo?
-    var isLoading: Bool = false
+
+    // MARK: - Entries (один на каждое введенное приложение)
+    var entries: [AppEntry] = []
+
+    // MARK: - Meta-analysis state
+    var metaSummary: String = ""
+    var isRunningMeta: Bool = false
+
+    // MARK: - Errors
     var isShowAlert: Bool = false
     var alertMessage: LocalizedStringResource = ""
-
-    // Reviews
-    var badReviews: [AppReview] = []
-    var isLoadingReviews: Bool = false
-    var maxBadRating: Int = 2
-
-    // AI summary
-    var complaintsSummary: String = ""
-    var isAnalyzing: Bool = false
 
     // MARK: - Dependencies
     @ObservationIgnored
@@ -33,9 +32,10 @@ final class AppInfoViewModel {
     @ObservationIgnored
     private var openAIService: OpenAIServicing
 
-    private var fetchTask: Task<Void, Never>?
-    private var reviewsTask: Task<Void, Never>?
-    private var analyzeTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var orchestratorTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var metaTask: Task<Void, Never>?
 
     // MARK: - Init
     init(appLookupService: AppLookupServicing, openAIService: OpenAIServicing) {
@@ -43,117 +43,192 @@ final class AppInfoViewModel {
         self.openAIService = openAIService
     }
 
-    // MARK: - Public
-    func fetch() {
-        fetchTask?.cancel()
-        reviewsTask?.cancel()
-        analyzeTask?.cancel()
-        fetchTask = Task {
-            defer { fetchTask = nil }
-            isLoading = true
-            info = nil
-            badReviews = []
-            complaintsSummary = ""
-            do {
-                try Task.checkCancellation()
-                let result = try await appLookupService.fetchInfo(
-                    appID: appIDInput,
-                    country: country.isEmpty ? "us" : country.lowercased()
-                )
-                try Task.checkCancellation()
-                info = result
-            } catch is CancellationError {
-                // ignore
-            } catch {
-                alertMessage = "\(error.localizedDescription)"
-                isShowAlert = true
-            }
-            isLoading = false
+    // MARK: - Derived progress
+    var progress: (done: Int, total: Int) {
+        (entries.filter { $0.isDone || $0.isFailed }.count, entries.count)
+    }
 
-            // Загружаем плохие отзывы после успешной загрузки инфо
-            if info != nil {
-                loadBadReviews()
-            }
+    var allDone: Bool {
+        !entries.isEmpty && entries.allSatisfy { $0.isDone || $0.isFailed }
+    }
+
+    var hasAnySuccess: Bool {
+        entries.contains(where: { $0.isDone })
+    }
+
+    // MARK: - Run analysis
+    func startAnalysis() {
+        orchestratorTask?.cancel()
+        let ids = parseAppIDs(from: appIDsInput)
+        guard !ids.isEmpty else {
+            alertMessage = "Введите хотя бы один Apple ID приложения."
+            isShowAlert = true
+            return
+        }
+
+        let countryLower = country.isEmpty ? "us" : country.lowercased()
+        entries = ids.map { AppEntry(appID: $0, country: countryLower) }
+        metaSummary = ""
+
+        orchestratorTask = Task { [weak self] in
+            await self?.runAll()
         }
     }
 
-    func loadBadReviews() {
-        reviewsTask?.cancel()
-        reviewsTask = Task {
-            defer { reviewsTask = nil }
-            isLoadingReviews = true
-            do {
-                try Task.checkCancellation()
-                let reviews = try await appLookupService.fetchBadReviews(
-                    appID: appIDInput,
-                    country: country.isEmpty ? "us" : country.lowercased(),
-                    maxRating: maxBadRating,
-                    pages: 10
-                )
-                try Task.checkCancellation()
-                badReviews = reviews
-            } catch is CancellationError {
-                // ignore
-            } catch {
-                // не показываем алерт — отзывы не критичны, только лог
-                print("Reviews fetch error: \(error.localizedDescription)")
-            }
-            isLoadingReviews = false
-        }
-    }
-
-    /// Собирает плохие отзывы (≤ 3 звёзды) и отправляет их в OpenAI для саммари жалоб.
-    func analyzeComplaints() {
-        guard let appTitle = info?.title else { return }
-        analyzeTask?.cancel()
-        analyzeTask = Task {
-            defer { analyzeTask = nil }
-            isAnalyzing = true
-            complaintsSummary = ""
-            do {
-                try Task.checkCancellation()
-                // Берём именно ≤ 3 для анализа (независимо от UI-пикера)
-                let reviewsForAnalysis = try await appLookupService.fetchBadReviews(
-                    appID: appIDInput,
-                    country: country.isEmpty ? "us" : country.lowercased(),
-                    maxRating: 3,
-                    pages: 10
-                )
-                try Task.checkCancellation()
-
-                guard !reviewsForAnalysis.isEmpty else {
-                    alertMessage = "Не нашёл отзывов ≤ 3 звезды для анализа."
-                    isShowAlert = true
-                    isAnalyzing = false
-                    return
-                }
-
-                let summary = try await openAIService.summarizeComplaints(
-                    appTitle: appTitle,
-                    reviews: reviewsForAnalysis
-                )
-                try Task.checkCancellation()
-                complaintsSummary = summary
-            } catch is CancellationError {
-                // ignore
-            } catch {
-                alertMessage = "\(error.localizedDescription)"
-                isShowAlert = true
-            }
-            isAnalyzing = false
-        }
+    func cancelAll() {
+        orchestratorTask?.cancel()
+        metaTask?.cancel()
+        orchestratorTask = nil
+        metaTask = nil
     }
 
     func reset() {
-        fetchTask?.cancel()
-        reviewsTask?.cancel()
-        analyzeTask?.cancel()
-        fetchTask = nil
-        reviewsTask = nil
-        analyzeTask = nil
-        info = nil
-        badReviews = []
-        complaintsSummary = ""
-        appIDInput = ""
+        cancelAll()
+        entries = []
+        metaSummary = ""
+        appIDsInput = ""
+    }
+
+    // MARK: - Orchestrator
+    private func runAll() async {
+        // Запускаем все приложения параллельно
+        await withTaskGroup(of: Void.self) { group in
+            for entry in entries {
+                group.addTask { [weak self] in
+                    await self?.process(entry: entry)
+                }
+            }
+        }
+    }
+
+    /// Полный цикл для одного приложения: info → reviews → complaints/praise (параллельно).
+    private func process(entry: AppEntry) async {
+        // 1) Info
+        entry.status = .loadingInfo
+        do {
+            try Task.checkCancellation()
+            let info = try await appLookupService.fetchInfo(
+                appID: entry.appID,
+                country: entry.country
+            )
+            entry.info = info
+        } catch is CancellationError {
+            return
+        } catch {
+            entry.status = .failed(error.localizedDescription)
+            return
+        }
+
+        // 2) Reviews (параллельно good + bad)
+        entry.status = .loadingReviews
+        async let badReviews = (try? appLookupService.fetchBadReviews(
+            appID: entry.appID,
+            country: entry.country,
+            maxRating: 3,
+            pages: 10
+        )) ?? []
+        async let goodReviews = (try? appLookupService.fetchGoodReviews(
+            appID: entry.appID,
+            country: entry.country,
+            minRating: 4,
+            limit: 80,
+            pages: 10
+        )) ?? []
+        entry.badReviews = await badReviews
+        entry.goodReviews = await goodReviews
+
+        // 3) Анализ жалоб (если есть данные)
+        entry.status = .analyzingComplaints
+        if !entry.badReviews.isEmpty, let title = entry.info?.title {
+            do {
+                try Task.checkCancellation()
+                entry.complaintsSummary = try await openAIService.summarizeComplaints(
+                    appTitle: title,
+                    reviews: entry.badReviews
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                entry.complaintsSummary = "Не удалось проанализировать жалобы: \(error.localizedDescription)"
+            }
+        }
+
+        // 4) Анализ плюсов
+        entry.status = .analyzingPraise
+        if !entry.goodReviews.isEmpty, let title = entry.info?.title {
+            do {
+                try Task.checkCancellation()
+                entry.praiseSummary = try await openAIService.summarizePraise(
+                    appTitle: title,
+                    reviews: entry.goodReviews
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                entry.praiseSummary = "Не удалось проанализировать плюсы: \(error.localizedDescription)"
+            }
+        }
+
+        entry.status = .done
+    }
+
+    // MARK: - Meta-analysis
+    func runMetaAnalysis() {
+        guard hasAnySuccess else { return }
+        metaTask?.cancel()
+        metaTask = Task { [weak self] in
+            guard let self else { return }
+            isRunningMeta = true
+            metaSummary = ""
+
+            let entriesPayload = entries.compactMap { entry -> MetaAnalysisPayload.AppEntry? in
+                guard let info = entry.info, entry.isDone else { return nil }
+                return MetaAnalysisPayload.AppEntry(
+                    title: info.title,
+                    subtitle: info.subtitle,
+                    genre: info.primaryGenre,
+                    installsEstimate: info.installEstimateMid,
+                    ratingsCount: info.ratingsCountTotal,
+                    averageRating: info.averageRating,
+                    isPaid: info.isPaid,
+                    formattedPrice: info.formattedPrice,
+                    iaps: info.iaps,
+                    complaintsSummary: entry.complaintsSummary,
+                    praiseSummary: entry.praiseSummary,
+                    revenueMinUSD: info.revenueMin,
+                    revenueMaxUSD: info.revenueMax
+                )
+            }
+
+            do {
+                try Task.checkCancellation()
+                let result = try await openAIService.metaAnalysis(
+                    payload: MetaAnalysisPayload(apps: entriesPayload)
+                )
+                try Task.checkCancellation()
+                metaSummary = result
+            } catch is CancellationError {
+                // ignore
+            } catch {
+                alertMessage = "\(error.localizedDescription)"
+                isShowAlert = true
+            }
+            isRunningMeta = false
+        }
+    }
+
+    // MARK: - Helpers
+    private func parseAppIDs(from raw: String) -> [String] {
+        let separators = CharacterSet(charactersIn: ", \n\t")
+        let tokens = raw.components(separatedBy: separators)
+        var seen = Set<String>()
+        var result: [String] = []
+        for token in tokens {
+            let cleaned = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty, Int(cleaned) != nil, !seen.contains(cleaned) else { continue }
+            seen.insert(cleaned)
+            result.append(cleaned)
+        }
+        return result
     }
 }
