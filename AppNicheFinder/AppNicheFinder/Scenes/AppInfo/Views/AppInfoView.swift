@@ -216,6 +216,10 @@ struct AppInfoView: View {
             Divider()
             installsBlock(info)
             Divider()
+            iapBlock(info)
+            Divider()
+            revenueBlock(info)
+            Divider()
             datesRow(info)
             Divider()
             descriptionBlock(info)
@@ -223,6 +227,81 @@ struct AppInfoView: View {
         .padding(14)
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    private func iapBlock(_ info: AppInfo) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Покупки и подписки")
+                    .font(.headline)
+                Spacer()
+                if !info.iaps.isEmpty {
+                    Text("\(info.iaps.count) шт.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if info.iaps.isEmpty {
+                Text("Покупок и подписок не найдено (Apple отдает только топ ~10).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                if info.hasSubscriptions {
+                    Text("Тип: подписочная модель (есть авто-возобновляемые покупки)")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+                VStack(spacing: 6) {
+                    ForEach(info.iaps) { iap in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: iap.isSubscription ? "arrow.triangle.2.circlepath.circle.fill" : "cart.fill")
+                                .foregroundStyle(iap.isSubscription ? Color.orange : Color.blue)
+                                .font(.subheadline)
+                            Text(iap.name)
+                                .font(.callout)
+                                .multilineTextAlignment(.leading)
+                            Spacer(minLength: 8)
+                            Text(iap.priceFormatted)
+                                .font(.callout.weight(.semibold))
+                        }
+                        .padding(8)
+                        .background(Color(.tertiarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+                Text("Средний чек: $\(String(format: "%.2f", info.averageIAPPrice))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func revenueBlock(_ info: AppInfo) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Примерный доход (lifetime)")
+                    .font(.headline)
+                Spacer()
+                Text(revenueModeLabel(info))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 16) {
+                metric(title: "Низкий", value: formattedMoney(info.revenueLow))
+                metric(title: "Средний", value: formattedMoney(info.revenueMid))
+                metric(title: "Высокий", value: formattedMoney(info.revenueHigh))
+            }
+
+            Text(info.revenueFormulaDescription)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Text("⚠️ Очень грубая оценка. Реальный доход знает только владелец через App Store Connect.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private func installsBlock(_ info: AppInfo) -> some View {
@@ -359,6 +438,32 @@ struct AppInfoView: View {
         f.numberStyle = .decimal
         f.groupingSeparator = " "
         return f.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    private func revenueModeLabel(_ info: AppInfo) -> String {
+        if info.isPaid { return "Платное • \(info.formattedPrice)" }
+        if info.hasSubscriptions { return "Free + подписки" }
+        if info.hasIAPs { return "Free + покупки" }
+        return "Free / без IAP"
+    }
+
+    private func formattedMoney(_ value: Double) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.maximumFractionDigits = 1
+        switch value {
+        case 1_000_000_000...:
+            return "$" + (f.string(from: NSNumber(value: value / 1_000_000_000)) ?? "0") + "B"
+        case 1_000_000...:
+            return "$" + (f.string(from: NSNumber(value: value / 1_000_000)) ?? "0") + "M"
+        case 1_000...:
+            return "$" + (f.string(from: NSNumber(value: value / 1_000)) ?? "0") + "K"
+        default:
+            f.numberStyle = .currency
+            f.currencyCode = "USD"
+            f.maximumFractionDigits = 0
+            return f.string(from: NSNumber(value: value)) ?? "$0"
+        }
     }
 
     private func formattedCompact(_ value: Int) -> String {

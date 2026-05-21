@@ -39,12 +39,12 @@ actor AppLookupService: AppLookupServicing {
         }
 
         async let lookup = fetchLookup(appID: cleanID, country: country)
-        async let subtitle = fetchSubtitle(appID: cleanID, country: country)
+        async let pageData = fetchPageData(appID: cleanID, country: country)
 
         let result = try await lookup
-        let parsedSubtitle = (try? await subtitle) ?? ""
+        let (parsedSubtitle, parsedIAPs) = await pageData
 
-        return makeAppInfo(from: result, subtitle: parsedSubtitle, country: country)
+        return makeAppInfo(from: result, subtitle: parsedSubtitle, iaps: parsedIAPs, country: country)
     }
 
     // MARK: - Bad reviews (RSS feed, up to 10 pages, ~500 reviews max)
@@ -152,45 +152,45 @@ actor AppLookupService: AppLookupServicing {
         }
     }
 
-    // MARK: - Subtitle parsing (not exposed via Lookup API)
-    private func fetchSubtitle(appID: String, country: String) async throws -> String {
-        guard let url = URL(string: "https://apps.apple.com/\(country)/app/id\(appID)") else { return "" }
-        var request = URLRequest(url: url)
-        request.setValue(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-            forHTTPHeaderField: "User-Agent"
-        )
+    // MARK: - Page data (subtitle + IAPs)
+    // apps.apple.com — полностью React/Vite SPA: в исходном HTML данных нет, всё рисуется JS.
+    // amp-api без bearer-токена закрыт (401). Самый надежный путь — отрендерить страницу
+    // в WKWebView и достать готовый DOM через evaluateJavaScript.
+    private func fetchPageData(appID: String, country: String) async -> (subtitle: String, iaps: [AppIAP]) {
+        let urlString = "https://apps.apple.com/\(country)/app/id\(appID)"
+        guard let url = URL(string: urlString) else { return ("", []) }
 
-        NetworkLogger.logRequest(request)
-
-        let data: Data
-        let response: URLResponse
+        let rendered: WebPageScraper.ScrapedPage
         do {
-            (data, response) = try await URLSession.shared.data(for: request)
+            rendered = try await WebPageScraper.shared.scrape(url: url)
         } catch {
-            NetworkLogger.logResponse(nil, data: nil, error: error, requestURL: request.url)
-            throw error
-        }
-        NetworkLogger.logResponse(response, data: data, requestURL: request.url)
-
-        guard let html = String(data: data, encoding: .utf8) else { return "" }
-
-        // 1) Try og:title-style header: <h2 class="product-header__subtitle ...">SUBTITLE</h2>
-        if let s = firstMatch(in: html,
-                              pattern: #"<h2[^>]*class="[^"]*product-header__subtitle[^"]*"[^>]*>([^<]+)</h2>"#) {
-            return s.trimmingCharacters(in: .whitespacesAndNewlines)
+            print("WebPageScraper error: \(error.localizedDescription)")
+            return ("", [])
         }
 
-        // 2) Fallback: schema.org JSON-LD "description" sometimes carries the marketing subtitle
-        if let s = firstMatch(in: html, pattern: #""applicationSubtitle"\s*:\s*"([^"]+)""#) {
-            return s.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Логируем как обычный сетевой ответ для удобства отладки
+        NetworkLogger.logRequest(URLRequest(url: url))
+        if let data = rendered.html.data(using: .utf8) {
+            NetworkLogger.logResponse(nil, data: data, requestURL: url)
         }
 
-        return ""
+        return (rendered.subtitle, rendered.iaps)
+    }
+
+    /// Достаёт числовое значение из строки цены "$9.99", "€4,99", "15,99 USD" и т.д.
+    nonisolated static func extractAmount(from text: String) -> Double? {
+        let filtered = text.unicodeScalars.filter { CharacterSet(charactersIn: "0123456789,.").contains($0) }
+        var s = String(String.UnicodeScalarView(filtered))
+        if !s.contains(".") && s.contains(",") {
+            s = s.replacingOccurrences(of: ",", with: ".")
+        } else {
+            s = s.replacingOccurrences(of: ",", with: "")
+        }
+        return Double(s)
     }
 
     // MARK: - Mapping
-    private func makeAppInfo(from r: AppLookupResult, subtitle: String, country: String) -> AppInfo {
+    private func makeAppInfo(from r: AppLookupResult, subtitle: String, iaps: [AppIAP], country: String) -> AppInfo {
         AppInfo(
             id: r.trackId,
             title: r.trackName,
@@ -205,7 +205,11 @@ actor AppLookupService: AppLookupServicing {
             storeURL: URL(string: r.trackViewUrl ?? ""),
             sellerName: r.sellerName ?? "",
             primaryGenre: r.primaryGenreName ?? "",
-            version: r.version ?? ""
+            version: r.version ?? "",
+            price: r.price ?? 0,
+            formattedPrice: r.formattedPrice ?? (r.price == 0 ? "Free" : ""),
+            currency: r.currency ?? "USD",
+            iaps: iaps
         )
     }
 
