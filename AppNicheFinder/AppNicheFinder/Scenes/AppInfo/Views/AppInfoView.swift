@@ -270,7 +270,7 @@ struct AppInfoView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
                 }
-                Text("Средний чек: $\(String(format: "%.2f", info.averageIAPPrice))")
+                Text("Годовая стоимость плана: $\(String(format: "%.0f", info.minYearlyIAPPrice)) – $\(String(format: "%.0f", info.maxYearlyIAPPrice))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -288,11 +288,18 @@ struct AppInfoView: View {
                     .foregroundStyle(.secondary)
             }
 
-            HStack(spacing: 16) {
-                metric(title: "Низкий", value: formattedMoney(info.revenueLow))
-                metric(title: "Средний", value: formattedMoney(info.revenueMid))
-                metric(title: "Высокий", value: formattedMoney(info.revenueHigh))
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(formattedMoney(info.revenueMin))
+                    .font(.title.weight(.bold))
+                    .foregroundStyle(.primary)
+                Text("–")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                Text(formattedMoney(info.revenueMax))
+                    .font(.title.weight(.bold))
+                    .foregroundStyle(.green)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             Text(info.revenueFormulaDescription)
                 .font(.caption2)

@@ -39,6 +39,27 @@ struct AppIAP: Identifiable, Hashable {
     let priceFormatted: String
     let price: Double
     let isSubscription: Bool
+
+    /// Нормализованная годовая стоимость для оценки LTV.
+    /// Weekly → ×52, Monthly → ×12, Yearly → ×1, Lifetime/IAP → как есть.
+    var normalizedYearlyPrice: Double {
+        let n = name.lowercased()
+        if isSubscription {
+            if n.contains("week") || n.contains("недел") || n.contains("еженедел") {
+                return price * 52
+            }
+            if n.contains("month") || n.contains("ежемес") || n.contains("месяч") {
+                return price * 12
+            }
+            if n.contains("year") || n.contains("annual") || n.contains("годов") || n.contains("ежегод") {
+                return price
+            }
+            // По умолчанию для подписки — месячная (самый частый дефолт)
+            return price * 12
+        }
+        // Одноразовая покупка — берем как есть (платится один раз за lifetime)
+        return price
+    }
 }
 
 // MARK: - Final UI model (combined data from Lookup + subtitle from page)
@@ -69,80 +90,70 @@ struct AppInfo: Identifiable, Hashable {
     var installEstimateMid: Int  { ratingsCountTotal * 100 }  // 1%   → mid estimate
     var installEstimateHigh: Int { ratingsCountTotal * 200 }  // 0.5% → upper install bound
 
-    // MARK: - Estimated lifetime revenue (very rough)
-    /// Доля разработчика (Apple берёт 15-30% — берём 15% как best-case для small business program).
-    private static let developerShare: Double = 0.85
+    // MARK: - Estimated lifetime revenue (refined: min/max vilka)
+    /// Доля разработчика. Apple берёт 30%; 15% — только для Small Business Program (≤ $1M/год оборота).
+    /// Берём 0.80 как разумный midpoint, чуть оптимистичнее 30%-варианта.
+    private static let developerShare: Double = 0.80
 
-    /// LTV-бенчмарки для free приложений БЕЗ IAP (per install, lifetime, USD) — ads/utility.
-    private static let ltvNoIapLow: Double  = 0.05
-    private static let ltvNoIapMid: Double  = 0.20
-    private static let ltvNoIapHigh: Double = 0.50
+    /// LTV-бенчмарки для free без IAP (per install, lifetime, USD).
+    /// Источник: ad-supported ARPU $0.50-$1/мес → за lifetime ~3-12 мес даёт $1.5-12.
+    private static let ltvNoIapMin: Double = 0.30
+    private static let ltvNoIapMax: Double = 5.00
 
-    /// Конверсия в платящего юзера (paying user rate) для free-app с IAP:
-    /// низ/средне/верх — индустрия даёт примерно 1% / 3% / 5% за весь lifetime.
-    private static let payingRateLow: Double  = 0.01
-    private static let payingRateMid: Double  = 0.03
-    private static let payingRateHigh: Double = 0.05
-
-    /// Множитель lifetime для подписок (~12 месяцев среднего срока).
-    private static let subscriptionLifetimeMonths: Double = 12
+    /// Конверсия в платящего юзера (freemium baseline 3%, sensitivity 2% / 5%).
+    private static let payingRateMin: Double = 0.02
+    private static let payingRateMax: Double = 0.05
 
     var isPaid: Bool { price > 0 }
     var hasIAPs: Bool { !iaps.isEmpty }
     var hasSubscriptions: Bool { iaps.contains(where: { $0.isSubscription }) }
 
-    /// Среднее значение цены IAP (используется для оценки revenue).
-    var averageIAPPrice: Double {
-        guard !iaps.isEmpty else { return 0 }
-        return iaps.map(\.price).reduce(0, +) / Double(iaps.count)
+    /// Самая дешёвая нормализованная (годовая) цена среди IAP.
+    var minYearlyIAPPrice: Double {
+        iaps.map(\.normalizedYearlyPrice).filter { $0 > 0 }.min() ?? 0
     }
 
-    /// Revenue estimate (USD), 3 bands: low / mid / high.
-    var revenueLow: Double {
+    /// Самая дорогая нормализованная (годовая) цена среди IAP.
+    var maxYearlyIAPPrice: Double {
+        iaps.map(\.normalizedYearlyPrice).filter { $0 > 0 }.max() ?? 0
+    }
+
+    // MARK: - Final revenue range (USD, lifetime)
+    /// Минимальная оценка дохода — нижняя установка × минимальный план × нижняя конверсия.
+    var revenueMin: Double {
         if isPaid {
             return Double(installEstimateLow) * price * AppInfo.developerShare
         }
         if hasIAPs {
-            let perPaying = averageIAPPrice * (hasSubscriptions ? AppInfo.subscriptionLifetimeMonths : 1)
-            return Double(installEstimateLow) * AppInfo.payingRateLow * perPaying * AppInfo.developerShare
+            return Double(installEstimateLow) * AppInfo.payingRateMin * minYearlyIAPPrice * AppInfo.developerShare
         }
-        return Double(installEstimateMid) * AppInfo.ltvNoIapLow
+        return Double(installEstimateLow) * AppInfo.ltvNoIapMin
     }
 
-    var revenueMid: Double {
-        if isPaid {
-            return Double(installEstimateMid) * price * AppInfo.developerShare
-        }
-        if hasIAPs {
-            let perPaying = averageIAPPrice * (hasSubscriptions ? AppInfo.subscriptionLifetimeMonths : 1)
-            return Double(installEstimateMid) * AppInfo.payingRateMid * perPaying * AppInfo.developerShare
-        }
-        return Double(installEstimateMid) * AppInfo.ltvNoIapMid
-    }
-
-    var revenueHigh: Double {
+    /// Максимальная оценка дохода — верхняя установка × максимальный план × верхняя конверсия.
+    var revenueMax: Double {
         if isPaid {
             return Double(installEstimateHigh) * price * AppInfo.developerShare
         }
         if hasIAPs {
-            let perPaying = averageIAPPrice * (hasSubscriptions ? AppInfo.subscriptionLifetimeMonths : 1)
-            return Double(installEstimateHigh) * AppInfo.payingRateHigh * perPaying * AppInfo.developerShare
+            return Double(installEstimateHigh) * AppInfo.payingRateMax * maxYearlyIAPPrice * AppInfo.developerShare
         }
-        return Double(installEstimateMid) * AppInfo.ltvNoIapHigh
+        return Double(installEstimateHigh) * AppInfo.ltvNoIapMax
     }
 
     var revenueFormulaDescription: String {
         if isPaid {
-            return "Платное (\(formattedPrice)): установки × цена × 85% (доля разработчика). Вилка — диапазон установок (×50 / ×100 / ×200 от оценок)."
+            return "Платное (\(formattedPrice)): установки × цена × 80%. Min/Max — за счёт вилки установок (×50…×200 от оценок)."
         }
         if hasIAPs {
-            let avg = String(format: "$%.2f", averageIAPPrice)
+            let minP = String(format: "$%.0f", minYearlyIAPPrice)
+            let maxP = String(format: "$%.0f", maxYearlyIAPPrice)
             if hasSubscriptions {
-                return "Free + подписки: установки × paying-rate (1/3/5%) × ср. чек \(avg) × 12 мес × 85%. Найдено подписок: учитываются как годовой lifetime."
+                return "Free + подписки: установки × paying-rate (2-5%) × годовая цена плана (\(minP)…\(maxP)) × 80%. Подписки нормализованы к году."
             } else {
-                return "Free + покупки: установки × paying-rate (1/3/5%) × ср. чек \(avg) × 85% (один платёж за lifetime)."
+                return "Free + покупки: установки × paying-rate (2-5%) × чек (\(minP)…\(maxP)) × 80% (одноразовый платёж)."
             }
         }
-        return "Free без IAP: установки × LTV ($0.05 / $0.20 / $0.50). Доход в основном от рекламы."
+        return "Free без IAP: установки × LTV ($0.30 на нижней / $5 на верхней). Основной доход — реклама."
     }
 }
