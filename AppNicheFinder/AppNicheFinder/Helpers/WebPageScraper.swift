@@ -70,7 +70,8 @@ final class WebPageScraper: NSObject {
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         let frame = CGRect(x: -2000, y: -2000, width: 1100, height: 2400) // за пределами экрана
         let webView = WKWebView(frame: frame, configuration: config)
-        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        // ВАЖНО: desktop UA. С мобильным UA Apple редиректит на itms-appss:// и навигация виснет.
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
         webView.navigationDelegate = navDelegate
         webView.isHidden = false
         webView.alpha = 0.01
@@ -363,6 +364,20 @@ final class WebPageScraper: NSObject {
 // MARK: - Navigation Delegate
 private final class NavDelegate: NSObject, WKNavigationDelegate {
     weak var owner: WebPageScraper?
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        // Apple для некоторых страниц шлет редирект на itms-appss:// — блокируем, чтобы навигация не зависла.
+        if let scheme = navigationAction.request.url?.scheme?.lowercased(),
+           scheme != "http", scheme != "https", scheme != "about" {
+            print("🟥 Scraper: blocked non-http redirect to \(navigationAction.request.url?.absoluteString ?? "?")")
+            decisionHandler(.cancel)
+            Task { @MainActor in
+                owner?.didFailNavigation(NSError(domain: "WebPageScraper", code: -1, userInfo: [NSLocalizedDescriptionKey: "Blocked redirect to \(scheme)://"]))
+            }
+            return
+        }
+        decisionHandler(.allow)
+    }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         Task { @MainActor in owner?.didStartNavigation() }
