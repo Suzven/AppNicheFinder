@@ -23,27 +23,37 @@ final class AppInfoViewModel {
     var isLoadingReviews: Bool = false
     var maxBadRating: Int = 2
 
+    // AI summary
+    var complaintsSummary: String = ""
+    var isAnalyzing: Bool = false
+
     // MARK: - Dependencies
     @ObservationIgnored
     private var appLookupService: AppLookupServicing
+    @ObservationIgnored
+    private var openAIService: OpenAIServicing
 
     private var fetchTask: Task<Void, Never>?
     private var reviewsTask: Task<Void, Never>?
+    private var analyzeTask: Task<Void, Never>?
 
     // MARK: - Init
-    init(appLookupService: AppLookupServicing) {
+    init(appLookupService: AppLookupServicing, openAIService: OpenAIServicing) {
         self.appLookupService = appLookupService
+        self.openAIService = openAIService
     }
 
     // MARK: - Public
     func fetch() {
         fetchTask?.cancel()
         reviewsTask?.cancel()
+        analyzeTask?.cancel()
         fetchTask = Task {
             defer { fetchTask = nil }
             isLoading = true
             info = nil
             badReviews = []
+            complaintsSummary = ""
             do {
                 try Task.checkCancellation()
                 let result = try await appLookupService.fetchInfo(
@@ -92,13 +102,58 @@ final class AppInfoViewModel {
         }
     }
 
+    /// Собирает плохие отзывы (≤ 3 звёзды) и отправляет их в OpenAI для саммари жалоб.
+    func analyzeComplaints() {
+        guard let appTitle = info?.title else { return }
+        analyzeTask?.cancel()
+        analyzeTask = Task {
+            defer { analyzeTask = nil }
+            isAnalyzing = true
+            complaintsSummary = ""
+            do {
+                try Task.checkCancellation()
+                // Берём именно ≤ 3 для анализа (независимо от UI-пикера)
+                let reviewsForAnalysis = try await appLookupService.fetchBadReviews(
+                    appID: appIDInput,
+                    country: country.isEmpty ? "us" : country.lowercased(),
+                    maxRating: 3,
+                    pages: 10
+                )
+                try Task.checkCancellation()
+
+                guard !reviewsForAnalysis.isEmpty else {
+                    alertMessage = "Не нашёл отзывов ≤ 3 звезды для анализа."
+                    isShowAlert = true
+                    isAnalyzing = false
+                    return
+                }
+
+                let summary = try await openAIService.summarizeComplaints(
+                    appTitle: appTitle,
+                    reviews: reviewsForAnalysis
+                )
+                try Task.checkCancellation()
+                complaintsSummary = summary
+            } catch is CancellationError {
+                // ignore
+            } catch {
+                alertMessage = "\(error.localizedDescription)"
+                isShowAlert = true
+            }
+            isAnalyzing = false
+        }
+    }
+
     func reset() {
         fetchTask?.cancel()
         reviewsTask?.cancel()
+        analyzeTask?.cancel()
         fetchTask = nil
         reviewsTask = nil
+        analyzeTask = nil
         info = nil
         badReviews = []
+        complaintsSummary = ""
         appIDInput = ""
     }
 }

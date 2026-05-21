@@ -12,9 +12,13 @@ final class Factory {
 
     // MARK: - Services (created once)
     private(set) lazy var appLookupService: AppLookupServicing = AppLookupService()
+    private(set) lazy var openAIService: OpenAIServicing = OpenAIService()
 
     // MARK: - ViewModel factories
     func appInfoVM() -> AppInfoViewModel {
-        AppInfoViewModel(appLookupService: appLookupService)
+        AppInfoViewModel(
+            appLookupService: appLookupService,
+            openAIService: openAIService
+        )
     }
 }

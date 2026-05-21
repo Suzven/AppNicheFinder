@@ -20,6 +20,7 @@ struct AppInfoView: View {
                             .padding(.top, 32)
                     } else if let info = viewModel.info {
                         resultSection(info)
+                        aiAnalysisSection
                         badReviewsSection
                     }
                 }
@@ -63,6 +64,51 @@ struct AppInfoView: View {
             .buttonStyle(.borderedProminent)
             .disabled(viewModel.appIDInput.trimmingCharacters(in: .whitespaces).isEmpty || viewModel.isLoading)
         }
+    }
+
+    private var aiAnalysisSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Анализ жалоб (AI)")
+                    .font(.headline)
+                Spacer()
+                if viewModel.isAnalyzing {
+                    ProgressView()
+                }
+            }
+
+            Text("Соберёт все отзывы с оценкой ≤ 3 и отправит в GPT-4o для саммари жалоб.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Button {
+                viewModel.analyzeComplaints()
+            } label: {
+                Label(viewModel.isAnalyzing ? "Анализируем…" : "Проанализировать плохие отзывы",
+                      systemImage: "sparkles")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(viewModel.isAnalyzing)
+
+            if !viewModel.complaintsSummary.isEmpty {
+                ScrollView {
+                    Text(viewModel.complaintsSummary)
+                        .font(.callout)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(12)
+                        .background(Color(.tertiarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .frame(maxHeight: 420)
+            }
+        }
+        .padding(14)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
     private var badReviewsSection: some View {
@@ -243,22 +289,12 @@ struct AppInfoView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 16) {
                 metric(
-                    title: "Оценка (всё время)",
+                    title: "Средняя оценка",
                     value: String(format: "%.2f", info.averageRating)
                 )
                 metric(
-                    title: "Оценок (всё время, \(info.countryCode))",
+                    title: "Оценок (\(info.countryCode))",
                     value: formattedNumber(info.ratingsCountTotal)
-                )
-            }
-            HStack(spacing: 16) {
-                metric(
-                    title: "Оценка (тек. версия)",
-                    value: String(format: "%.2f", info.averageRatingCurrentVersion)
-                )
-                metric(
-                    title: "Оценок (тек. версия)",
-                    value: formattedNumber(info.ratingsCountCurrentVersion)
                 )
                 if !info.version.isEmpty {
                     metric(title: "Версия", value: info.version)
