@@ -187,22 +187,13 @@ actor AppLookupService: AppLookupServicing {
     private func fetchPageData(appID: String, country: String) async -> (subtitle: String, iaps: [AppIAP]) {
         let urlString = "https://apps.apple.com/\(country)/app/id\(appID)"
         guard let url = URL(string: urlString) else { return ("", []) }
-
-        let rendered: WebPageScraper.ScrapedPage
         do {
-            rendered = try await WebPageScraper.shared.scrape(url: url)
+            let rendered = try await WebPageScraper.shared.scrape(url: url)
+            return (rendered.subtitle, rendered.iaps)
         } catch {
             print("WebPageScraper error: \(error.localizedDescription)")
             return ("", [])
         }
-
-        // Логируем как обычный сетевой ответ для удобства отладки
-        NetworkLogger.logRequest(URLRequest(url: url))
-        if let data = rendered.html.data(using: .utf8) {
-            NetworkLogger.logResponse(nil, data: data, requestURL: url)
-        }
-
-        return (rendered.subtitle, rendered.iaps)
     }
 
     /// Достаёт числовое значение из строки цены "$9.99", "€4,99", "15,99 USD" и т.д.

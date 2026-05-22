@@ -2,11 +2,18 @@
 //  WebPageScraper.swift
 //  AppNicheFinder
 //
-//  apps.apple.com теперь полностью клиентский SPA: всё рисуется JS на лету.
-//  Эта реализация открывает страницу в скрытом WKWebView, прикрепляет его
-//  к UIWindow (без этого layout не выполняется), ждёт пока DOM стабилизируется
-//  и появится блок IAP, затем достаёт subtitle и список покупок через
-//  evaluateJavaScript.
+//  Hybrid-парсер страницы App Store:
+//
+//  1) FAST PATH — прямой HTTP-запрос и парсинг встроенного JSON
+//     `<script id="serialized-server-data">`. Гарантированно даёт subtitle
+//     и top-1 IAP, который Apple рендерит на лендинге.
+//
+//  2) DEEP PATH — WKWebView (всегда форсим `us`-локаль для стабильности
+//     английских селекторов). После загрузки страницы кликаем по строке
+//     "In-App Purchases" в секции Information → открывается модалка с
+//     ПОЛНЫМ списком IAP, которую парсим из DOM.
+//
+//  Результаты обоих путей мёрджатся; дубли убираются по productID / name+price.
 //
 
 import Foundation
@@ -21,7 +28,6 @@ final class WebPageScraper: NSObject {
     private static let logger = Logger(subsystem: "AppNicheFinder", category: "Scraper")
 
     struct ScrapedPage {
-        let html: String
         let subtitle: String
         let iaps: [AppIAP]
     }
@@ -35,15 +41,16 @@ final class WebPageScraper: NSObject {
             switch self {
             case .loadFailed:    return "Не удалось загрузить страницу App Store."
             case .timeout:       return "Страница не отрисовалась за отведённое время."
-            case .alreadyRunning: return "Скрейпер уже занят другим запросом."
+            case .alreadyRunning: return "Скрейпер занят другим запросом — попробуйте чуть позже."
             }
         }
     }
 
     private var webView: WKWebView?
-    private var continuation: CheckedContinuation<ScrapedPage, Error>?
+    private var continuation: CheckedContinuation<[AppIAP], Error>?
     private var timeoutTask: Task<Void, Never>?
     private var settleTask: Task<Void, Never>?
+    private var deepChain: Task<Void, Never> = Task {}
     private let navDelegate = NavDelegate()
 
     override init() {
@@ -51,46 +58,431 @@ final class WebPageScraper: NSObject {
         navDelegate.owner = self
     }
 
+    // MARK: - Public entrypoint
     func scrape(url: URL) async throws -> ScrapedPage {
-        if continuation != nil {
-            print("🟥 Scraper: alreadyRunning (продолжение уже занято)")
-            throw ScrapeError.alreadyRunning
-        }
-        print("🟢 Scraper: scrape() called for \(url.absoluteString)")
+        // Принудительно us — английская локаль, стабильные селекторы.
+        let usURL = forceUSLocale(url) ?? url
 
-        // Цепляем webView к уже существующему окну приложения — без этого
-        // в iOS WKWebView не получает layout и navigation никогда не завершается.
-        guard let hostView = Self.hostViewForScraper() else {
-            print("🟥 Scraper: не нашёл host UIWindow — приложение ещё не активно")
-            throw ScrapeError.loadFailed
+        // 1) Быстрый путь: SSD JSON (subtitle гарантировано, IAPs — частично)
+        async let ssdResult: (subtitle: String, iaps: [AppIAP]) = fetchSSD(url: usURL)
+
+        // 2) Глубокий путь: WKWebView. Сериализуем, чтобы при N приложениях
+        //    parallel-таски не дрались за единственный WKWebView.
+        let prevChain = deepChain
+        let myDeepTask = Task<[AppIAP], Never> { [weak self] in
+            _ = await prevChain.value
+            guard let self else { return [] }
+            do {
+                return try await self.fetchDeepIAPs(url: usURL)
+            } catch {
+                print("🟥 Deep scraper failed: \(error.localizedDescription)")
+                return []
+            }
         }
-        print("🟢 Scraper: host view found = \(type(of: hostView))")
+        deepChain = Task { _ = await myDeepTask.value }
+
+        let (subtitle, ssdIAPs) = await ssdResult
+        let deep = await myDeepTask.value
+
+        // Мёрж по productID / name+price
+        var merged: [AppIAP] = []
+        var seen = Set<String>()
+        for source in [ssdIAPs, deep] {
+            for iap in source {
+                let key = iap.id.isEmpty ? "\(iap.name)|\(iap.priceFormatted)" : iap.id
+                guard !seen.contains(key) else { continue }
+                seen.insert(key)
+                merged.append(iap)
+            }
+        }
+
+        print("🔎 Scraper FINAL: subtitle=\(subtitle.isEmpty ? "EMPTY" : "\"\(subtitle)\"")  iaps=\(merged.count) (ssd=\(ssdIAPs.count), deep=\(deep.count))")
+        return ScrapedPage(subtitle: subtitle, iaps: merged)
+    }
+
+    private func forceUSLocale(_ url: URL) -> URL? {
+        guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        // Заменяем /xx/ в начале пути на /us/
+        let pathParts = comps.path.split(separator: "/", omittingEmptySubsequences: false)
+        if pathParts.count > 1 && pathParts[1].count == 2 {
+            comps.path = "/us/" + pathParts.dropFirst(2).joined(separator: "/")
+        }
+        // Удаляем параметр l=...
+        comps.queryItems = comps.queryItems?.filter { $0.name != "l" }
+        return comps.url
+    }
+
+    // MARK: - FAST PATH: SSD JSON
+    private nonisolated func fetchSSD(url: URL) async -> (subtitle: String, iaps: [AppIAP]) {
+        var request = URLRequest(url: url)
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            forHTTPHeaderField: "User-Agent"
+        )
+        NetworkLogger.logRequest(request)
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            NetworkLogger.logResponse(response, data: Data(), requestURL: url)
+            guard let html = String(data: data, encoding: .utf8) else { return ("", []) }
+            guard let ssdRaw = Self.extractSSD(from: html) else { return ("", []) }
+            let decoded = Self.htmlDecode(ssdRaw)
+            guard let jsonData = decoded.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
+            else { return ("", []) }
+            return (Self.extractSubtitle(from: json), Self.extractIAPsFromSSD(json: json))
+        } catch {
+            return ("", [])
+        }
+    }
+
+    // MARK: - DEEP PATH: WKWebView click & scrape modal
+    private func fetchDeepIAPs(url: URL) async throws -> [AppIAP] {
+        if continuation != nil { throw ScrapeError.alreadyRunning }
+        guard let hostView = Self.hostViewForScraper() else { throw ScrapeError.loadFailed }
 
         let config = WKWebViewConfiguration()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
-        let frame = CGRect(x: -2000, y: -2000, width: 1100, height: 2400) // за пределами экрана
-        let webView = WKWebView(frame: frame, configuration: config)
-        // ВАЖНО: desktop UA. С мобильным UA Apple редиректит на itms-appss:// и навигация виснет.
+        let webView = WKWebView(
+            frame: CGRect(x: -2000, y: -2000, width: 1200, height: 2400),
+            configuration: config
+        )
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
         webView.navigationDelegate = navDelegate
-        webView.isHidden = false
         webView.alpha = 0.01
         hostView.addSubview(webView)
         self.webView = webView
 
-        print("🟢 Scraper: webView attached, loading…")
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<ScrapedPage, Error>) in
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[AppIAP], Error>) in
             self.continuation = cont
             self.timeoutTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 30_000_000_000) // 30s hard cap
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
                 print("🟥 Scraper: TIMEOUT")
                 await self?.finish(with: .failure(ScrapeError.timeout))
             }
             webView.load(URLRequest(url: url))
+            print("🟢 Scraper: WKWebView loading \(url.absoluteString)")
         }
     }
 
-    /// Находит view ключевого окна приложения, к которому можно прикрепить скрытый webView.
+    fileprivate func didFinishNavigation() {
+        print("🟢 Scraper: navigation finished, starting interaction")
+        settleTask?.cancel()
+        settleTask = Task { [weak self] in
+            guard let self else { return }
+            // Дать странице 3 секунды на client-side гидрацию
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+
+            // Сначала пробуем кликнуть по "In-App Purchases" в Information section.
+            _ = await self.runJS(Self.clickIAPInfoRowJS)
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+
+            // Парсим DOM после клика
+            var collected = await self.extractIAPsFromDOM()
+
+            // Если модалка не открылась — пробуем парсить из текущего DOM как есть
+            if collected.isEmpty {
+                for _ in 0..<4 {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    collected = await self.extractIAPsFromDOM()
+                    if !collected.isEmpty { break }
+                }
+            }
+
+            await self.finish(with: .success(collected))
+        }
+    }
+
+    fileprivate func didFailNavigation(_ error: Error) {
+        print("🟥 Scraper: nav failed — \(error.localizedDescription)")
+        Task { await finish(with: .failure(error)) }
+    }
+
+    private func finish(with result: Result<[AppIAP], Error>) async {
+        timeoutTask?.cancel()
+        settleTask?.cancel()
+        timeoutTask = nil
+        settleTask = nil
+        webView?.stopLoading()
+        webView?.navigationDelegate = nil
+        webView?.removeFromSuperview()
+        webView = nil
+        guard let cont = continuation else { return }
+        continuation = nil
+        switch result {
+        case .success(let v): cont.resume(returning: v)
+        case .failure(let e): cont.resume(throwing: e)
+        }
+    }
+
+    private func runJS(_ js: String) async -> Any? {
+        guard let webView else { return nil }
+        return try? await webView.evaluateJavaScript(js)
+    }
+
+    private func extractIAPsFromDOM() async -> [AppIAP] {
+        let raw = await runJS(Self.extractIAPsFromDOMJS) as? String ?? ""
+        guard let data = raw.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return [] }
+        var out: [AppIAP] = []
+        var seen = Set<String>()
+        for item in arr {
+            guard let name = item["name"] as? String, !name.isEmpty else { continue }
+            guard let priceFmt = item["price"] as? String, !priceFmt.isEmpty else { continue }
+            guard let priceVal = AppLookupService.extractAmount(from: priceFmt), priceVal > 0 else { continue }
+            let lowName = name.lowercased()
+            let isSub = ["subscription", "weekly", "monthly", "yearly", "annual", "premium"]
+                .contains(where: { lowName.contains($0) })
+            let key = "\(name)|\(priceFmt)"
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            out.append(AppIAP(
+                id: key,
+                name: name,
+                priceFormatted: priceFmt,
+                price: priceVal,
+                isSubscription: isSub
+            ))
+        }
+        return out
+    }
+
+    // MARK: - JS injections
+    /// Находит в Information кнопку с текстом "In-App Purchases" и кликает её.
+    private static let clickIAPInfoRowJS: String = #"""
+    (function() {
+        function clickIf(el) {
+            if (!el) return false;
+            // Ищем ближайший кликабельный (button или [role=button])
+            let node = el;
+            for (let i = 0; i < 5 && node; i++) {
+                if (node.tagName === 'BUTTON' || node.getAttribute && node.getAttribute('role') === 'button') {
+                    node.click();
+                    return true;
+                }
+                node = node.parentElement;
+            }
+            // Иначе кликаем сам элемент
+            try { el.click(); return true; } catch(e) { return false; }
+        }
+        // a) ищем кнопку с aria-label или текстом "In-App Purchases"
+        const all = document.querySelectorAll('button, [role="button"], a, span, dt, dd');
+        for (const el of all) {
+            const txt = (el.textContent || '').trim();
+            if (/^In[\u2010\u2011\u2012\u2013\-‑‒]App Purchases$/i.test(txt)
+                || txt.toLowerCase() === 'in-app purchases'
+                || txt.toLowerCase() === 'in‑app purchases') {
+                // Найден заголовок — кликаем по нему или соседу с "Yes" / "See All"
+                if (clickIf(el)) return 'clicked-header';
+                let sib = el.nextElementSibling;
+                if (sib && clickIf(sib)) return 'clicked-sibling';
+                let parent = el.parentElement;
+                if (parent) {
+                    const btn = parent.querySelector('button, [role="button"], a');
+                    if (clickIf(btn)) return 'clicked-parent-button';
+                }
+            }
+        }
+        // b) ищем кнопку "See All" рядом с любым "Subscriptions" заголовком
+        const headings = document.querySelectorAll('h2, h3, h4');
+        for (const h of headings) {
+            const txt = (h.textContent || '').toLowerCase();
+            if (txt.includes('subscription') || txt.includes('in-app') || txt.includes('in‑app')) {
+                const container = h.closest('section') || h.parentElement;
+                if (container) {
+                    const btn = container.querySelector('button:not([disabled]), a[href]');
+                    if (clickIf(btn)) return 'clicked-shelf-see-all';
+                }
+            }
+        }
+        return 'not-found';
+    })();
+    """#
+
+    /// Извлекает IAP из DOM (после клика — модалка, либо из существующего шелфа).
+    private static let extractIAPsFromDOMJS: String = #"""
+    (function() {
+        function txt(el){ return ((el && (el.innerText || el.textContent)) || '').trim().replace(/\s+/g, ' '); }
+        function isPrice(s) {
+            if (!s) return false;
+            return /[\d][\d.,]{0,12}/.test(s) &&
+                   /(\$|€|£|₽|¥|USD|EUR|RUB|GBP|JPY|CNY|UAH|PLN|TRY|INR|BRL|CAD|AUD|KRW|MXN|ARS|HKD)/i.test(s);
+        }
+        const out = [];
+        const seen = new Set();
+
+        // 1) Если открылась модалка — её содержимое имеет role=dialog или класс с modal/dialog
+        let containers = Array.from(document.querySelectorAll(
+            '[role="dialog"], .we-modal, .we-modal__content, [class*="dialog"], [class*="modal"]'
+        ));
+
+        // 2) Кроме модалки, всегда смотрим shelf с subscriptions/in-app-purchases на странице
+        const shelves = document.querySelectorAll('section, ol, ul');
+        for (const sec of shelves) {
+            const head = sec.querySelector('h2, h3, h4');
+            if (!head) continue;
+            const t = (head.textContent || '').toLowerCase();
+            if (t.includes('subscription') || t.includes('in-app') || t.includes('in‑app') || t.includes('purchases')) {
+                containers.push(sec);
+            }
+        }
+
+        // 3) Дефолт — весь body (на крайний случай)
+        if (containers.length === 0) containers = [document.body];
+
+        for (const container of containers) {
+            // a) Структурный список: ищем элементы со связкой название + цена
+            const items = container.querySelectorAll(
+                'li, .we-modal__inappprods__list__item, .information-list__item, ol > div, dl > div, [class*="lockup"]'
+            );
+            for (const it of items) {
+                // Берём первый осмысленный текст как имя, последний ценовой как цена
+                const candidates = it.querySelectorAll('span, dt, dd, div, p, h3');
+                let name = '', price = '';
+                for (const c of candidates) {
+                    const t = txt(c);
+                    if (!t) continue;
+                    if (!name && !isPrice(t) && t.length < 120 && t.length > 1) name = t;
+                    if (isPrice(t) && t.length < 30) price = t;
+                }
+                if (!name) name = txt(it).split('\n')[0];
+                if (!name || !price) continue;
+                const key = name + '|' + price;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push({ name, price });
+            }
+        }
+
+        // 4) Fallback: ищем все «ценовые» узлы во всем документе и тащим соседа
+        if (out.length === 0) {
+            const all = document.querySelectorAll('span, p, div, td');
+            for (const node of all) {
+                const t = txt(node);
+                if (!isPrice(t) || t.length > 30) continue;
+                const row = node.closest('li, tr, dl > div, .information-list__item') || node.parentElement;
+                if (!row) continue;
+                let rowText = txt(row);
+                if (!rowText) continue;
+                let name = rowText.replace(t, '').trim();
+                if (!name || name.length > 120 || name.length < 2) continue;
+                const key = name + '|' + t;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push({ name, price: t });
+                if (out.length >= 30) break;
+            }
+        }
+
+        return JSON.stringify(out);
+    })();
+    """#
+
+    // MARK: - SSD helpers (pure functions — nonisolated for background SSD path)
+    nonisolated private static func extractSSD(from html: String) -> String? {
+        let pattern = #"<script[^>]*id="serialized-server-data"[^>]*>([\s\S]+?)</script>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return nil }
+        let range = NSRange(html.startIndex..., in: html)
+        guard let match = regex.firstMatch(in: html, range: range),
+              match.numberOfRanges >= 2,
+              let r = Range(match.range(at: 1), in: html) else { return nil }
+        return String(html[r])
+    }
+
+    nonisolated private static func htmlDecode(_ s: String) -> String {
+        s.replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#34;", with: "\"")
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&#x27;", with: "'")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+    }
+
+    nonisolated private static func extractSubtitle(from root: [String: Any]) -> String {
+        let dataArr = (root["data"] as? [[String: Any]]) ?? []
+        guard let first = dataArr.first,
+              let pageData = first["data"] as? [String: Any] else { return "" }
+        if let lockup = pageData["lockup"] as? [String: Any],
+           let subtitle = lockup["subtitle"] as? String, !subtitle.isEmpty {
+            return subtitle
+        }
+        if let titleProps = pageData["titleOfferDisplayProperties"] as? [String: Any],
+           let subtitles = titleProps["subtitles"] as? [String: Any],
+           let std = subtitles["standard"] as? String, !std.isEmpty {
+            return std
+        }
+        return ""
+    }
+
+    nonisolated private static func extractIAPsFromSSD(json root: [String: Any]) -> [AppIAP] {
+        let dataArr = (root["data"] as? [[String: Any]]) ?? []
+        guard let first = dataArr.first,
+              let pageData = first["data"] as? [String: Any],
+              let shelfMapping = pageData["shelfMapping"] as? [String: Any]
+        else { return [] }
+        var result: [AppIAP] = []
+        var seen = Set<String>()
+        for (shelfKey, shelfValue) in shelfMapping {
+            guard let shelf = shelfValue as? [String: Any] else { continue }
+            let contentType = (shelf["contentType"] as? String) ?? ""
+            let isIAPShelf = contentType.lowercased().contains("inapppurchase")
+                || shelfKey.lowercased().contains("subscription")
+                || shelfKey.lowercased().contains("inapp")
+            guard isIAPShelf else { continue }
+            guard let items = shelf["items"] as? [[String: Any]] else { continue }
+            for item in items {
+                guard let iap = makeIAPFromSSDItem(item, shelfKey: shelfKey) else { continue }
+                guard !seen.contains(iap.id) else { continue }
+                seen.insert(iap.id)
+                result.append(iap)
+            }
+        }
+        return result
+    }
+
+    nonisolated private static func makeIAPFromSSDItem(_ item: [String: Any], shelfKey: String) -> AppIAP? {
+        guard let name = (item["title"] as? String) ?? (item["productDescription"] as? String),
+              !name.isEmpty else { return nil }
+        guard let priceValue = findPrice(in: item), priceValue > 0 else { return nil }
+        let productID: String = {
+            if let action = item["buttonAction"] as? [String: Any],
+               let pid = action["productIdentifier"] as? String { return pid }
+            return ""
+        }()
+        let lowKey = shelfKey.lowercased()
+        let lowPid = productID.lowercased()
+        let lowName = name.lowercased()
+        let isSub =
+            lowKey.contains("subscription")
+            || lowPid.contains("sub")
+            || lowName.contains("subscription") || lowName.contains("подписк")
+            || lowName.contains("weekly") || lowName.contains("monthly") || lowName.contains("yearly") || lowName.contains("annual")
+        let priceFormatted = String(format: "$%.2f", priceValue)
+        let id = productID.isEmpty ? "\(name)|\(priceValue)" : productID
+        return AppIAP(id: id, name: name, priceFormatted: priceFormatted,
+                      price: priceValue, isSubscription: isSub)
+    }
+
+    nonisolated private static func findPrice(in value: Any) -> Double? {
+        if let dict = value as? [String: Any] {
+            if let p = dict["price"] {
+                if let d = p as? Double, d > 0 { return d }
+                if let i = p as? Int { return Double(i) }
+                if let s = p as? String, let d = Double(s), d > 0 { return d }
+            }
+            for (_, sub) in dict {
+                if let found = findPrice(in: sub) { return found }
+            }
+        } else if let arr = value as? [Any] {
+            for item in arr {
+                if let found = findPrice(in: item) { return found }
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Host view
     private static func hostViewForScraper() -> UIView? {
         let scenes = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
@@ -100,287 +492,27 @@ final class WebPageScraper: NSObject {
                 return keyWindow
             }
         }
-        // Запасной вариант: любое окно
         return UIApplication.shared.connectedScenes
             .compactMap { ($0 as? UIWindowScene)?.windows.first }
             .first
     }
-
-    // MARK: - Navigation callbacks
-
-    fileprivate func didStartNavigation() {
-        print("🟢 Scraper: navigation STARTED")
-    }
-
-    fileprivate func didFinishNavigation() {
-        print("🟢 Scraper: navigation FINISHED, starting DOM polling")
-        settleTask?.cancel()
-        settleTask = Task { [weak self] in
-            guard let self else { return }
-            // Долгий warm-up: React/Svelte монтируется и подгружает IAP отдельной XHR.
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
-            for attempt in 0..<14 {
-                if Task.isCancelled { return }
-                let result = await self.tryExtract(attempt: attempt)
-                // Принимаем как успешный, если есть IAP ИЛИ subtitle и прошли минимум 4 попытки
-                if !result.iaps.isEmpty {
-                    await self.finish(with: .success(result))
-                    return
-                }
-                if attempt >= 8 && !result.subtitle.isEmpty {
-                    await self.finish(with: .success(result))
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            }
-            // Финальная попытка: отдаём что есть, даже если пусто
-            let last = await self.tryExtract(attempt: 99)
-            await self.finish(with: .success(last))
-        }
-    }
-
-    fileprivate func didFailNavigation(_ error: Error) {
-        print("🟥 Scraper: navigation FAILED — \(error.localizedDescription)")
-        Task { await finish(with: .failure(error)) }
-    }
-
-    private func finish(with result: Result<ScrapedPage, Error>) async {
-        timeoutTask?.cancel()
-        settleTask?.cancel()
-        timeoutTask = nil
-        settleTask = nil
-        webView?.stopLoading()
-        webView?.navigationDelegate = nil
-        webView?.removeFromSuperview()
-        webView = nil
-
-        guard let cont = continuation else { return }
-        continuation = nil
-        switch result {
-        case .success(let value): cont.resume(returning: value)
-        case .failure(let err):   cont.resume(throwing: err)
-        }
-    }
-
-    // MARK: - DOM extraction
-    private func tryExtract(attempt: Int) async -> ScrapedPage {
-        guard let webView else {
-            return ScrapedPage(html: "", subtitle: "", iaps: [])
-        }
-        let js = Self.extractionJS
-        do {
-            let raw = try await webView.evaluateJavaScript(js)
-            guard let str = raw as? String,
-                  let data = str.data(using: .utf8),
-                  let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else {
-                Self.logger.debug("Scraper attempt \(attempt): JS returned non-string")
-                return ScrapedPage(html: "", subtitle: "", iaps: [])
-            }
-
-            let subtitle = (dict["subtitle"] as? String) ?? ""
-            let rawIAPs = (dict["iaps"] as? [[String: Any]]) ?? []
-            let debugInfo = (dict["debug"] as? String) ?? ""
-
-            Self.logger.debug("Scraper attempt \(attempt): subtitle=\(subtitle.isEmpty ? "EMPTY" : subtitle, privacy: .public), iaps=\(rawIAPs.count), debug=\(debugInfo, privacy: .public)")
-            print("🔎 Scraper attempt \(attempt): subtitle=\(subtitle.isEmpty ? "EMPTY" : "\"\(subtitle)\"")  iaps=\(rawIAPs.count)  debug=\(debugInfo)")
-
-            let iaps: [AppIAP] = rawIAPs.compactMap { item in
-                guard let name = item["name"] as? String,
-                      let priceFmt = item["priceFormatted"] as? String,
-                      let price = AppLookupService.extractAmount(from: priceFmt),
-                      price > 0
-                else { return nil }
-                let lowName = name.lowercased()
-                let subscriptionMarkers = ["subscription", "подписк", "weekly", "monthly", "yearly", "annual",
-                                           "ежемес", "годов", "недельн", "premium", "премиум"]
-                let isSub = subscriptionMarkers.contains(where: { lowName.contains($0) })
-                return AppIAP(
-                    id: name + "|" + priceFmt,
-                    name: name,
-                    priceFormatted: priceFmt,
-                    price: price,
-                    isSubscription: isSub
-                )
-            }
-
-            return ScrapedPage(html: "", subtitle: subtitle, iaps: iaps)
-        } catch {
-            Self.logger.debug("Scraper attempt \(attempt): JS error \(error.localizedDescription, privacy: .public)")
-            return ScrapedPage(html: "", subtitle: "", iaps: [])
-        }
-    }
-
-    // MARK: - The JS itself
-    // Slепой и устойчивый к смене классов: ищем по тексту-маяку, потом собираем
-    // все «пары» нейм+цена в соседних элементах.
-    private static let extractionJS: String = #"""
-    (function() {
-        function txt(el){ return ((el && (el.innerText || el.textContent)) || "").trim().replace(/\s+/g, " "); }
-
-        // ---------- SUBTITLE ----------
-        let subtitle = "";
-
-        // a) Текущая разметка
-        const sel1 = document.querySelector('h2.product-header__subtitle, .product-header__subtitle');
-        if (sel1) subtitle = txt(sel1);
-
-        // b) Свежие веб-компоненты
-        if (!subtitle) {
-            const meta = document.querySelector('meta[name="apple:subtitle"], meta[property="og:description"]');
-            if (meta) subtitle = (meta.getAttribute('content') || '').trim();
-        }
-
-        // c) Универсальный fallback: первый h2 рядом с h1 в шапке
-        if (!subtitle) {
-            const h1 = document.querySelector('h1');
-            if (h1) {
-                let cur = h1.nextElementSibling;
-                for (let i = 0; cur && i < 5; i++, cur = cur.nextElementSibling) {
-                    if (cur.tagName === 'H2') { subtitle = txt(cur); break; }
-                    const inner = cur.querySelector && cur.querySelector('h2');
-                    if (inner) { subtitle = txt(inner); break; }
-                }
-            }
-        }
-
-        // ---------- IAPs ----------
-        const iapHeadings = ['in-app purchases', 'in‑app purchases', 'встроенные покупки',
-                             'compras dentro de la app', 'käufe in der app', 'achats intégrés',
-                             'acquisti in-app', '应用内购买', '앱 내 구입', '内蔵購入'];
-        const subscriptionMarkers = ['subscription', 'подписк', 'weekly', 'monthly', 'yearly',
-                                     'ежемес', 'годов', 'недельн', 'premium', 'премиум'];
-
-        function looksLikePrice(s) {
-            if (!s) return false;
-            return /[\d][\d.,]{0,12}/.test(s) &&
-                   /(\$|€|£|₽|¥|USD|EUR|RUB|GBP|JPY|CNY|UAH|PLN|TRY|INR|BRL|CAD|AUD|KRW|MXN|ARS|HKD)/i.test(s);
-        }
-
-        const out = [];
-        const seen = new Set();
-
-        // 1) Найти узел-якорь по тексту "Встроенные покупки" / "In-App Purchases"
-        const all = document.querySelectorAll('h1, h2, h3, h4, dt, p, span, div');
-        let anchor = null;
-        for (const el of all) {
-            const t = (txt(el) || '').toLowerCase();
-            if (!t) continue;
-            for (const needle of iapHeadings) {
-                if (t === needle || t.startsWith(needle)) { anchor = el; break; }
-            }
-            if (anchor) break;
-        }
-
-        // 2) Поднимаемся к контейнеру (section/dl/ul/div) и собираем элементы
-        if (anchor) {
-            let container = anchor;
-            for (let i = 0; i < 6 && container.parentElement; i++) {
-                container = container.parentElement;
-                // Если внутри уже виден список — стоп
-                if (container.querySelectorAll('li, dl > div, .information-list__item').length >= 2) break;
-            }
-
-            // Пробуем структурный список
-            const itemSelectors = [
-                '.information-list__item',
-                'li',
-                'dl > div',
-                '.we-modal__inappprods__list__item'
-            ];
-            let items = [];
-            for (const s of itemSelectors) {
-                const found = container.querySelectorAll(s);
-                if (found.length >= 1) { items = Array.from(found); break; }
-            }
-
-            for (const it of items) {
-                // У Apple обычно: первый <span>/<dt> — название, последний — цена.
-                const candidates = it.querySelectorAll('span, dt, dd, div, p');
-                let name = '', price = '';
-                // Берём первый текстовый, который не цена, и последний, который похож на цену
-                for (const c of candidates) {
-                    const t = txt(c);
-                    if (!t) continue;
-                    if (!name && !looksLikePrice(t) && t.length < 120) name = t;
-                    if (looksLikePrice(t)) price = t;
-                }
-                if (!name) name = txt(it).split('\n')[0];
-                if (!name || !price) continue;
-
-                const key = name + '|' + price;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                out.push({ name, priceFormatted: price });
-            }
-        }
-
-        // 3) Fallback: парные dt/dd по всему документу — берём только те, где цена.
-        if (out.length === 0) {
-            const dts = document.querySelectorAll('dt');
-            for (const dt of dts) {
-                const dd = dt.nextElementSibling;
-                if (!dd || dd.tagName !== 'DD') continue;
-                const name = txt(dt), price = txt(dd);
-                if (!name || !looksLikePrice(price)) continue;
-                const key = name + '|' + price;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                out.push({ name, priceFormatted: price });
-            }
-        }
-
-        // 4) Fallback: ищем "ценовые" узлы и берём ближайший текстовый сосед как имя.
-        if (out.length === 0) {
-            const allNodes = document.querySelectorAll('span, p, div');
-            for (const node of allNodes) {
-                const price = txt(node);
-                if (!looksLikePrice(price) || price.length > 30) continue;
-                const parent = node.parentElement;
-                if (!parent) continue;
-                // имя = первый осмысленный текст в этом же li/row
-                const row = parent.closest('li, .information-list__item, dl > div, tr') || parent;
-                const rowText = txt(row);
-                if (!rowText || rowText === price) continue;
-                let name = rowText.replace(price, '').trim();
-                if (!name || name.length > 120) continue;
-                const key = name + '|' + price;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                out.push({ name, priceFormatted: price });
-                if (out.length >= 20) break;
-            }
-        }
-
-        return JSON.stringify({
-            subtitle: subtitle,
-            iaps: out,
-            debug: 'len=' + document.documentElement.outerHTML.length + ',anchor=' + (anchor ? 'yes' : 'no')
-        });
-    })();
-    """#
 }
 
-// MARK: - Navigation Delegate
+// MARK: - Navigation delegate
 private final class NavDelegate: NSObject, WKNavigationDelegate {
     weak var owner: WebPageScraper?
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        // Apple для некоторых страниц шлет редирект на itms-appss:// — блокируем, чтобы навигация не зависла.
         if let scheme = navigationAction.request.url?.scheme?.lowercased(),
            scheme != "http", scheme != "https", scheme != "about" {
-            print("🟥 Scraper: blocked non-http redirect to \(navigationAction.request.url?.absoluteString ?? "?")")
             decisionHandler(.cancel)
             Task { @MainActor in
-                owner?.didFailNavigation(NSError(domain: "WebPageScraper", code: -1, userInfo: [NSLocalizedDescriptionKey: "Blocked redirect to \(scheme)://"]))
+                owner?.didFailNavigation(NSError(domain: "WebPageScraper", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Blocked redirect to \(scheme)://"]))
             }
             return
         }
         decisionHandler(.allow)
-    }
-
-    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        Task { @MainActor in owner?.didStartNavigation() }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
