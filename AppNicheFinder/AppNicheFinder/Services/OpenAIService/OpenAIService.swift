@@ -29,6 +29,28 @@ protocol OpenAIServicing {
     func summarizeComplaints(appTitle: String, reviews: [AppReview]) async throws -> String
     func summarizePraise(appTitle: String, reviews: [AppReview]) async throws -> String
     func metaAnalysis(payload: MetaAnalysisPayload) async throws -> String
+    func asoAnalysis(payload: ASOAnalysisPayload) async throws -> String
+}
+
+// MARK: - ASO analysis input
+struct ASOAnalysisPayload {
+    /// Один конкурент с данными для ASO-анализа.
+    struct CompetitorEntry {
+        let title: String
+        let subtitle: String
+        let description: String
+        let genre: String
+        let installsEstimate: Int    // примерные установки (review-rate)
+        let ratingsCount: Int
+        let averageRating: Double
+        /// keyword → position
+        let keywordPositions: [String: Int]
+    }
+    /// Резюме ниши (вывод предыдущего metaAnalysis).
+    let nicheSummary: String
+    let competitors: [CompetitorEntry]
+    /// Список keywords которые мы исследовали (объединение discovery + keyword check).
+    let allKeywords: [String]
 }
 
 // MARK: - Meta-analysis input
@@ -275,6 +297,126 @@ actor OpenAIService: OpenAIServicing {
 
         let userPrompt = "Данные по конкурентам:\n\n\(corpus)\(kwBlock)"
         return try await chat(system: systemPrompt, user: userPrompt, temperature: 0.4, maxTokens: 6000)
+    }
+
+    // MARK: - ASO analysis
+    func asoAnalysis(payload: ASOAnalysisPayload) async throws -> String {
+        guard !payload.competitors.isEmpty else { throw OpenAIError.noReviews }
+
+        // Сборка корпуса по конкурентам
+        var corpus = ""
+        for (i, c) in payload.competitors.enumerated() {
+            let truncatedDesc = c.description.count > 1200
+                ? String(c.description.prefix(1200)) + "…[обрезано]"
+                : c.description
+
+            let kwLines: String = c.keywordPositions.isEmpty
+                ? "    (не нашлось в top-200 по нашим ключам)"
+                : c.keywordPositions
+                    .sorted(by: { $0.value < $1.value })
+                    .map { "    «\($0.key)» → позиция \($0.value)" }
+                    .joined(separator: "\n")
+
+            corpus += """
+            =====================================
+            КОНКУРЕНТ #\(i + 1)
+            Title:    \(c.title)
+            Subtitle: \(c.subtitle.isEmpty ? "—" : c.subtitle)
+            Категория: \(c.genre)
+            Оценка: \(String(format: "%.2f", c.averageRating)) (\(c.ratingsCount) оценок)
+            Примерные установки (review-rate ≈1%, ОЦЕНОЧНО): \(c.installsEstimate)
+
+            Позиции по ключам:
+            \(kwLines)
+
+            Описание:
+            \(truncatedDesc)
+
+            """
+        }
+
+        let kwList = payload.allKeywords.isEmpty
+            ? "(не задано)"
+            : payload.allKeywords.joined(separator: ", ")
+
+        let systemPrompt = """
+        Ты — senior ASO-эксперт (App Store Optimization) с экспертизой по App Store search ranking,
+        конверсии лендинга и стратегиям отзывов. Тебе дают:
+        - Резюме ниши (вывод предыдущего конкурентного анализа, включая идею MVP).
+        - Данные по топовым конкурентам: title, subtitle, description, категория, оценки,
+          ПРИМЕРНЫЕ установки (это оценочное число от review-rate, не точное), позиции в App Store search по ряду ключей.
+        - Список keywords, по которым мы изучали нишу.
+
+        ВАЖНО: число установок — примерное, ОЦЕНОЧНОЕ, не реальное. Не делай выводов вида
+        «X имеет 10M пользователей». Говори «оценочно ~10M». Реальные данные знают только владельцы.
+
+        Твоя задача — провести ASO-аналитику и подготовить готовые тексты для лендинга нового
+        приложения, идею которого ты увидишь в резюме ниши.
+
+        Структура ответа на русском языке, чётко по секциям:
+
+        ## 1. Почему топовые конкуренты в топе по ключам
+        Для каждого keyword (главных 5-10), проанализируй на ТОПОВЫХ конкурентах:
+        - Используется ли keyword в title? В subtitle? В описании? Сколько раз?
+        - Какая связка title+subtitle позволяет им ранжироваться.
+        - Какие синонимы / long-tail формы они используют.
+        - Корреляция между числом оценок и позицией (Apple учитывает popularity).
+        Делай выводы конкретно: «Конкурент X в #1 по \"plant identifier\" потому что использует
+        keyword в title \"Plant Identifier — …\" + 100k оценок».
+
+        ## 2. Insights для нового приложения
+        - Какие ключи реально достижимы для нового MVP (с нулём оценок).
+        - В каких ключах есть «дыры» — конкуренты слабы или не таргетят.
+        - Long-tail ключи (3+ слова) с низкой конкуренцией.
+
+        ## 3. ГОТОВЫЕ ТЕКСТЫ для App Store Connect
+
+        ### 3.1 Title (max 30 символов)
+        Дай 3 варианта в формате `Главный keyword — Бренд` (Apple ранжирует тяжелее всего по словам в Title).
+        Под каждым вариантом — счётчик символов и какие keyword-сигналы он закрывает.
+
+        ### 3.2 Subtitle (max 30 символов)
+        Дай 3 варианта. Subtitle — второй по весу для search. Содержит вторичные keywords
+        которые не влезли в title. Тоже укажи длину и keyword-coverage.
+
+        ### 3.3 Keywords field (max 100 символов, через запятую без пробелов)
+        Список через запятую без пробелов и без повторов слов из title/subtitle (Apple не учитывает дубли).
+        Стратегия: long-tail и синонимы, plural/singular формы где уместно. Укажи итоговую длину строки.
+
+        ### 3.4 Promotional Text (max 170 символов)
+        Текст который можно менять без апрува. Главная USP + call-to-action.
+
+        ### 3.5 Description (4000 символов max, но дай ~1500-2000)
+        Структурированное описание: первые 3 строки (видны без раскрытия) — самые сильные.
+        Далее блоки: «Why us», «Key features» (буллеты с keywords), «How it works», «Subscription terms».
+        Естественно вшивай главные keywords в текст (но без keyword-stuffing).
+
+        ## 4. Стратегия отзывов под ASO
+        Apple учитывает текст отзывов в search ranking (особенно за последние ~90 дней).
+        Подготовь 5 шаблонов реалистичных позитивных отзывов:
+        - Каждый со своей persona (новичок/эксперт/родитель/студент и т.д.)
+        - В каждом органично вшит 1-2 главных keyword + 1 long-tail
+        - Естественный язык, без шаблонной кальки
+        - В разных тонах: восторг / удивление / описание сценария использования
+
+        Под каждым отзывом укажи какие ключи он усиливает.
+
+        Будь конкретен, давай готовые строки которые можно копировать в App Store Connect.
+        Не лей воду. Все примеры — на английском (App Store US), но пояснения на русском.
+        Если в инпуте «резюме ниши» пусто — сделай универсальное предположение, но отметь это.
+        """
+
+        let userPrompt = """
+        РЕЗЮМЕ НИШИ (из предыдущего анализа):
+        \(payload.nicheSummary.isEmpty ? "(не сформировано — действуй универсально)" : payload.nicheSummary)
+
+        ИССЛЕДОВАННЫЕ KEYWORDS: \(kwList)
+
+        ДАННЫЕ КОНКУРЕНТОВ:
+        \(corpus)
+        """
+
+        return try await chat(system: systemPrompt, user: userPrompt, temperature: 0.5, maxTokens: 6000)
     }
 
     // MARK: - Helpers

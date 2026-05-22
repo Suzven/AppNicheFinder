@@ -33,6 +33,7 @@ struct AppInfoView: View {
                             KeywordCheckView(viewModel: viewModel)
                             metaAnalysisSection
                             if !viewModel.metaSummary.isEmpty {
+                                asoAnalysisSection
                                 trafficBudgetSection
                             }
                         }
@@ -173,6 +174,49 @@ struct AppInfoView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .frame(maxHeight: 600)
+            }
+        }
+        .padding(14)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    // MARK: - ASO analysis section
+    private var asoAnalysisSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("ASO Аналитика").font(.headline)
+                Spacer()
+                if viewModel.isRunningASO {
+                    ProgressView().scaleEffect(0.8)
+                }
+            }
+            Text("На основе резюме ниши и позиций конкурентов GPT сгенерирует готовые title / subtitle / description / keywords / шаблоны отзывов для App Store Connect.")
+                .font(.caption).foregroundStyle(.secondary)
+
+            Button {
+                viewModel.runASOAnalysis()
+            } label: {
+                Label(viewModel.asoSummary.isEmpty ? "ASO Аналитика" : "Перегенерировать",
+                      systemImage: "doc.text.magnifyingglass")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(viewModel.isRunningASO)
+
+            if !viewModel.asoSummary.isEmpty {
+                ScrollView {
+                    Text(viewModel.asoSummary)
+                        .font(.callout)
+                        .textSelection(.enabled)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(Color(.tertiarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .frame(maxHeight: 700)
             }
         }
         .padding(14)

@@ -37,6 +37,10 @@ final class AppInfoViewModel {
     var metaSummary: String = ""
     var isRunningMeta: Bool = false
 
+    // MARK: - ASO state
+    var asoSummary: String = ""
+    var isRunningASO: Bool = false
+
     // MARK: - Keyword search state
     var keywordsInput: String = ""
     var keywordResults: [KeywordResult] = []
@@ -61,6 +65,8 @@ final class AppInfoViewModel {
     private var keywordsTask: Task<Void, Never>?
     @ObservationIgnored
     private var discoveryTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var asoTask: Task<Void, Never>?
 
     // MARK: - Init
     init(appLookupService: AppLookupServicing, openAIService: OpenAIServicing) {
@@ -121,16 +127,19 @@ final class AppInfoViewModel {
         metaTask?.cancel()
         keywordsTask?.cancel()
         discoveryTask?.cancel()
+        asoTask?.cancel()
         orchestratorTask = nil
         metaTask = nil
         keywordsTask = nil
         discoveryTask = nil
+        asoTask = nil
     }
 
     func reset() {
         cancelAll()
         entries = []
         metaSummary = ""
+        asoSummary = ""
         appIDsInput = ""
         discoveryKeywordsInput = ""
         discoveredApps = []
@@ -392,6 +401,75 @@ final class AppInfoViewModel {
                 isShowAlert = true
             }
             isRunningMeta = false
+        }
+    }
+
+    // MARK: - ASO analysis
+    func runASOAnalysis() {
+        guard hasAnySuccess else { return }
+        guard !metaSummary.isEmpty else {
+            alertMessage = "Сначала запусти Summarize All — нужен анализ ниши."
+            isShowAlert = true
+            return
+        }
+        asoTask?.cancel()
+        asoTask = Task { [weak self] in
+            guard let self else { return }
+            isRunningASO = true
+            asoSummary = ""
+
+            // Сборка конкурентов
+            let competitors: [ASOAnalysisPayload.CompetitorEntry] = entries.compactMap { entry in
+                guard let info = entry.info, entry.isDone else { return nil }
+                let trackId = Int(entry.appID) ?? -1
+
+                // Объединяем позиции из discovery и keyword check
+                var positions: [String: Int] = [:]
+                if let disc = discoveredApps.first(where: { $0.id == trackId }) {
+                    for (kw, pos) in disc.positions { positions[kw] = pos }
+                }
+                for kr in keywordResults {
+                    if let pos = kr.positions[trackId] { positions[kr.keyword] = pos }
+                }
+
+                return ASOAnalysisPayload.CompetitorEntry(
+                    title: info.title,
+                    subtitle: info.subtitle,
+                    description: info.description,
+                    genre: info.primaryGenre,
+                    installsEstimate: info.installEstimateMid,
+                    ratingsCount: info.ratingsCountTotal,
+                    averageRating: info.averageRating,
+                    keywordPositions: positions
+                )
+            }
+
+            // Собираем уникальный список всех ключей которые мы исследовали
+            var kwSet = Set<String>()
+            for kr in keywordResults { kwSet.insert(kr.keyword) }
+            for d in discoveredApps {
+                for kw in d.positions.keys { kwSet.insert(kw) }
+            }
+            let allKeywords = Array(kwSet).sorted()
+
+            let payload = ASOAnalysisPayload(
+                nicheSummary: metaSummary,
+                competitors: competitors,
+                allKeywords: allKeywords
+            )
+
+            do {
+                try Task.checkCancellation()
+                let result = try await openAIService.asoAnalysis(payload: payload)
+                try Task.checkCancellation()
+                asoSummary = result
+            } catch is CancellationError {
+                // ignore
+            } catch {
+                alertMessage = "\(error.localizedDescription)"
+                isShowAlert = true
+            }
+            isRunningASO = false
         }
     }
 
