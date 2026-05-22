@@ -196,7 +196,10 @@ final class AppInfoViewModel {
                     complaintsSummary: entry.complaintsSummary,
                     praiseSummary: entry.praiseSummary,
                     revenueMinUSD: info.revenueMin,
-                    revenueMaxUSD: info.revenueMax
+                    revenueMaxUSD: info.revenueMax,
+                    firstReleaseDate: info.firstReleaseDate,
+                    lastUpdateDate: info.lastUpdateDate,
+                    description: info.description
                 )
             }
 
