@@ -51,6 +51,11 @@ final class AppInfoViewModel {
     var isShowAlert: Bool = false
     var alertMessage: LocalizedStringResource = ""
 
+    // MARK: - Session linkage
+    /// id текущей открытой сессии. Если nil — анализ ещё не сохранён.
+    var currentSessionID: UUID?
+    var currentSessionName: String = ""
+
     // MARK: - Dependencies
     @ObservationIgnored
     private var appLookupService: AppLookupServicing
@@ -116,6 +121,10 @@ final class AppInfoViewModel {
         let countryLower = country.isEmpty ? "us" : country.lowercased()
         entries = ids.map { AppEntry(appID: $0, country: countryLower) }
         metaSummary = ""
+        asoSummary = ""
+        // Новый набор приложений → начинаем новую сессию
+        currentSessionID = nil
+        currentSessionName = ""
 
         orchestratorTask = Task { [weak self] in
             await self?.runAll()
@@ -159,6 +168,8 @@ final class AppInfoViewModel {
                 }
             }
         }
+        // Все завершились — авто-сохраняем сессию
+        if hasAnySuccess { saveCurrentSession() }
     }
 
     /// Полный цикл для одного приложения: info → reviews → complaints/praise (параллельно).
@@ -394,6 +405,7 @@ final class AppInfoViewModel {
                 )
                 try Task.checkCancellation()
                 metaSummary = result
+                saveCurrentSession()
             } catch is CancellationError {
                 // ignore
             } catch {
@@ -463,6 +475,7 @@ final class AppInfoViewModel {
                 let result = try await openAIService.asoAnalysis(payload: payload)
                 try Task.checkCancellation()
                 asoSummary = result
+                saveCurrentSession()
             } catch is CancellationError {
                 // ignore
             } catch {
@@ -471,6 +484,86 @@ final class AppInfoViewModel {
             }
             isRunningASO = false
         }
+    }
+
+    // MARK: - Session persistence
+    /// Сохраняет текущее состояние как сессию. Если сессия уже была загружена/создана —
+    /// обновляет её, иначе создаёт новую.
+    @discardableResult
+    func saveCurrentSession(name customName: String? = nil) -> AnalysisSession? {
+        guard !entries.isEmpty else { return nil }
+
+        let id = currentSessionID ?? UUID()
+        let name = customName ?? (currentSessionName.isEmpty ? defaultSessionName() : currentSessionName)
+        let now = Date()
+
+        let session = AnalysisSession(
+            id: id,
+            name: name,
+            createdAt: now, // если сессия уже была — пересохраним createdAt ниже
+            updatedAt: now,
+            country: country,
+            mode: mode.rawValue,
+            appIDsInput: appIDsInput,
+            discoveryKeywordsInput: discoveryKeywordsInput,
+            keywordsInput: keywordsInput,
+            entries: entries.map { $0.toDTO() },
+            discoveredApps: discoveredApps.map { $0.toDTO() },
+            keywordResults: keywordResults.map { $0.toDTO() },
+            metaSummary: metaSummary,
+            asoSummary: asoSummary
+        )
+
+        // Сохраняем createdAt от исходной версии, если есть
+        var toSave = session
+        if let existing = SessionStore.shared.load(id: id) {
+            toSave.createdAt = existing.createdAt
+        }
+        let saved = SessionStore.shared.save(toSave)
+        currentSessionID = saved.id
+        currentSessionName = saved.name
+        return saved
+    }
+
+    /// Загружает сессию по ID. Заменяет всё текущее состояние.
+    func loadSession(_ id: UUID) {
+        guard let session = SessionStore.shared.load(id: id) else { return }
+        cancelAll()
+
+        currentSessionID = session.id
+        currentSessionName = session.name
+        country = session.country
+        mode = AnalysisMode(rawValue: session.mode) ?? .byIDs
+        appIDsInput = session.appIDsInput
+        discoveryKeywordsInput = session.discoveryKeywordsInput
+        keywordsInput = session.keywordsInput
+
+        entries = session.entries.map { AppEntry.fromDTO($0) }
+        discoveredApps = session.discoveredApps.map(DiscoveredApp.init)
+        keywordResults = session.keywordResults.map(KeywordResult.init)
+        metaSummary = session.metaSummary
+        asoSummary = session.asoSummary
+
+        // последний снимок исследованных keyword-ов
+        lastDiscoveryKeywords = Array(Set(discoveredApps.flatMap { $0.positions.keys })).sorted()
+        selectedDiscoveredIDs = []
+    }
+
+    /// Очищает текущее состояние и отключает связь с сессией (для нового анализа).
+    func newSession() {
+        reset()
+        currentSessionID = nil
+        currentSessionName = ""
+    }
+
+    private func defaultSessionName() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "dd.MM HH:mm"
+        let date = f.string(from: Date())
+        if let firstTitle = entries.compactMap({ $0.info?.title }).first {
+            return "\(firstTitle) — \(date)"
+        }
+        return "Сессия \(date)"
     }
 
     // MARK: - Helpers

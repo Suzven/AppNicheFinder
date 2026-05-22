@@ -9,6 +9,8 @@ struct AppInfoView: View {
     @State private var viewModel = Factory.shared.appInfoVM()
     @State private var settings = AppSettings.shared
     @State private var isSettingsPresented: Bool = false
+    @State private var isSessionsPresented: Bool = false
+    @State private var sessionStore = SessionStore.shared
     @FocusState private var isInputFocused: Bool
 
     var body: some View {
@@ -41,9 +43,21 @@ struct AppInfoView: View {
                 }
                 .padding(16)
             }
-            .navigationTitle("Niche Finder")
+            .navigationTitle(viewModel.currentSessionName.isEmpty ? "Niche Finder" : viewModel.currentSessionName)
             .scrollDismissesKeyboard(.interactively)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        isSessionsPresented = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "clock.arrow.circlepath")
+                            if !sessionStore.sessions.isEmpty {
+                                Text("\(sessionStore.sessions.count)").font(.caption2)
+                            }
+                        }
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         isSettingsPresented = true
@@ -55,6 +69,9 @@ struct AppInfoView: View {
             }
             .sheet(isPresented: $isSettingsPresented) {
                 SettingsView()
+            }
+            .sheet(isPresented: $isSessionsPresented) {
+                SessionsView(viewModel: viewModel)
             }
             .alert(viewModel.alertMessage, isPresented: $viewModel.isShowAlert) {
                 Button("OK", role: .cancel) {}
