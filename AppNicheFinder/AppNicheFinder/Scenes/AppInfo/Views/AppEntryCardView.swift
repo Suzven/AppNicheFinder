@@ -7,11 +7,15 @@ import SwiftUI
 
 struct AppEntryCardView: View {
     @Bindable var entry: AppEntry
+    let keywordPositions: [(keyword: String, position: Int)]
     @State private var isExpanded: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
+            if !keywordPositions.isEmpty {
+                keywordPositionsRow
+            }
             if let info = entry.info {
                 shortMetrics(info)
                 if isExpanded { fullDetails(info) }
@@ -67,6 +71,38 @@ struct AppEntryCardView: View {
             Text(entry.statusLabel)
                 .font(.caption)
                 .foregroundStyle(entry.isFailed ? .red : .secondary)
+        }
+    }
+
+    // MARK: - Keyword positions chip row
+    private var keywordPositionsRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Позиции по ключам").font(.caption2).foregroundStyle(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(keywordPositions, id: \.keyword) { item in
+                        HStack(spacing: 3) {
+                            Text(item.keyword).font(.caption2).lineLimit(1)
+                            Text("#\(item.position)")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(positionColor(item.position))
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color(.tertiarySystemFill))
+                        .clipShape(Capsule())
+                    }
+                }
+            }
+        }
+    }
+
+    private func positionColor(_ pos: Int) -> Color {
+        switch pos {
+        case 1...3:   return .green
+        case 4...10:  return .blue
+        case 11...30: return .orange
+        default:      return .secondary
         }
     }
 

@@ -10,10 +10,25 @@ import SwiftUI
 @Observable
 final class AppInfoViewModel {
 
+    // MARK: - Mode
+    enum AnalysisMode: String, CaseIterable, Identifiable {
+        case byIDs = "По Apple ID"
+        case byKeywords = "По ключам"
+        var id: String { rawValue }
+    }
+    var mode: AnalysisMode = .byIDs
+
     // MARK: - Input
     /// Многострочный ввод: один ID на строку или через запятую/пробел.
     var appIDsInput: String = ""
     var country: String = "us"
+
+    // MARK: - Discovery state (для режима byKeywords)
+    var discoveryKeywordsInput: String = ""
+    var discoveredApps: [DiscoveredApp] = []
+    var selectedDiscoveredIDs: Set<Int> = []
+    var isRunningDiscovery: Bool = false
+    var lastDiscoveryKeywords: [String] = [] // для отображения колонок матрицы
 
     // MARK: - Entries (один на каждое введенное приложение)
     var entries: [AppEntry] = []
@@ -21,6 +36,12 @@ final class AppInfoViewModel {
     // MARK: - Meta-analysis state
     var metaSummary: String = ""
     var isRunningMeta: Bool = false
+
+    // MARK: - Keyword search state
+    var keywordsInput: String = ""
+    var keywordResults: [KeywordResult] = []
+    var isRunningKeywords: Bool = false
+    var keywordsProgress: (done: Int, total: Int) = (0, 0)
 
     // MARK: - Errors
     var isShowAlert: Bool = false
@@ -36,6 +57,10 @@ final class AppInfoViewModel {
     private var orchestratorTask: Task<Void, Never>?
     @ObservationIgnored
     private var metaTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var keywordsTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var discoveryTask: Task<Void, Never>?
 
     // MARK: - Init
     init(appLookupService: AppLookupServicing, openAIService: OpenAIServicing) {
@@ -54,6 +79,22 @@ final class AppInfoViewModel {
 
     var hasAnySuccess: Bool {
         entries.contains(where: { $0.isDone })
+    }
+
+    /// Позиции конкретного приложения по проверенным keyword-ам (discovery + KeywordCheck).
+    /// Объединяет данные из discoveredApps и keywordResults.
+    func keywordPositions(for entry: AppEntry) -> [(keyword: String, position: Int)] {
+        guard let trackId = Int(entry.appID) else { return [] }
+        var merged: [String: Int] = [:]
+        // 1) discovery
+        if let disc = discoveredApps.first(where: { $0.id == trackId }) {
+            for (kw, pos) in disc.positions { merged[kw] = pos }
+        }
+        // 2) keyword check (постфактумный)
+        for kr in keywordResults {
+            if let pos = kr.positions[trackId] { merged[kr.keyword] = pos }
+        }
+        return merged.sorted { $0.value < $1.value }.map { (keyword: $0.key, position: $0.value) }
     }
 
     // MARK: - Run analysis
@@ -78,8 +119,12 @@ final class AppInfoViewModel {
     func cancelAll() {
         orchestratorTask?.cancel()
         metaTask?.cancel()
+        keywordsTask?.cancel()
+        discoveryTask?.cancel()
         orchestratorTask = nil
         metaTask = nil
+        keywordsTask = nil
+        discoveryTask = nil
     }
 
     func reset() {
@@ -87,6 +132,12 @@ final class AppInfoViewModel {
         entries = []
         metaSummary = ""
         appIDsInput = ""
+        discoveryKeywordsInput = ""
+        discoveredApps = []
+        selectedDiscoveredIDs = []
+        lastDiscoveryKeywords = []
+        keywordsInput = ""
+        keywordResults = []
     }
 
     // MARK: - Orchestrator
@@ -172,6 +223,122 @@ final class AppInfoViewModel {
         entry.status = .done
     }
 
+    // MARK: - Keyword discovery (поиск конкурентов по ключам)
+    func runDiscovery() {
+        discoveryTask?.cancel()
+        let keywords = parseKeywords(from: discoveryKeywordsInput)
+        guard !keywords.isEmpty else {
+            alertMessage = "Введите хотя бы один ключ."
+            isShowAlert = true
+            return
+        }
+        let countryLower = country.isEmpty ? "us" : country.lowercased()
+
+        discoveryTask = Task { [weak self] in
+            guard let self else { return }
+            isRunningDiscovery = true
+            discoveredApps = []
+            selectedDiscoveredIDs = []
+            lastDiscoveryKeywords = keywords
+
+            do {
+                let found = try await appLookupService.discoverByKeywords(
+                    keywords, country: countryLower, perKeywordLimit: 30
+                )
+                discoveredApps = found
+            } catch {
+                alertMessage = "\(error.localizedDescription)"
+                isShowAlert = true
+            }
+            isRunningDiscovery = false
+        }
+    }
+
+    /// Запускает полный анализ для отмеченных приложений из discovery.
+    func startAnalysisFromDiscovery() {
+        guard !selectedDiscoveredIDs.isEmpty else {
+            alertMessage = "Отметьте хотя бы одно приложение."
+            isShowAlert = true
+            return
+        }
+        // Записываем ID в appIDsInput (чтобы был согласованный input) и стартуем
+        appIDsInput = selectedDiscoveredIDs.map(String.init).joined(separator: "\n")
+        startAnalysis()
+    }
+
+    func toggleDiscoveredSelection(_ trackId: Int) {
+        if selectedDiscoveredIDs.contains(trackId) {
+            selectedDiscoveredIDs.remove(trackId)
+        } else {
+            selectedDiscoveredIDs.insert(trackId)
+        }
+    }
+
+    func selectAllDiscovered() {
+        selectedDiscoveredIDs = Set(discoveredApps.map(\.id))
+    }
+
+    func deselectAllDiscovered() {
+        selectedDiscoveredIDs = []
+    }
+
+    // MARK: - Keyword check
+    func runKeywordCheck() {
+        keywordsTask?.cancel()
+        let keywords = parseKeywords(from: keywordsInput)
+        guard !keywords.isEmpty else {
+            alertMessage = "Введите хотя бы один ключ."
+            isShowAlert = true
+            return
+        }
+        let trackedIDs: Set<Int> = Set(entries.compactMap { Int($0.appID) })
+        let countryLower = country.isEmpty ? "us" : country.lowercased()
+
+        keywordsTask = Task { [weak self] in
+            guard let self else { return }
+            isRunningKeywords = true
+            keywordResults = []
+            keywordsProgress = (0, keywords.count)
+
+            // Параллельно, но с лимитом по 4 одновременных (rate-limit для iTunes API)
+            var results: [KeywordResult] = []
+            let lock = NSLock()
+
+            await withTaskGroup(of: KeywordResult?.self) { group in
+                let semaphore = AsyncSemaphore(limit: 4)
+                for kw in keywords {
+                    group.addTask { [weak self] in
+                        await semaphore.wait()
+                        defer { Task { await semaphore.signal() } }
+                        guard let self else { return nil }
+                        do {
+                            return try await self.appLookupService.searchKeyword(
+                                kw, country: countryLower, trackedAppIDs: trackedIDs
+                            )
+                        } catch {
+                            return KeywordResult(keyword: kw, topResults: [], positions: [:])
+                        }
+                    }
+                }
+                for await result in group {
+                    if let result {
+                        lock.lock()
+                        results.append(result)
+                        lock.unlock()
+                        keywordsProgress.done += 1
+                    }
+                }
+            }
+
+            // сохраняем в порядке введённых ключей
+            let order = Dictionary(uniqueKeysWithValues: keywords.enumerated().map { ($1, $0) })
+            keywordResults = results.sorted {
+                (order[$0.keyword] ?? 0) < (order[$1.keyword] ?? 0)
+            }
+            isRunningKeywords = false
+        }
+    }
+
     // MARK: - Meta-analysis
     func runMetaAnalysis() {
         guard hasAnySuccess else { return }
@@ -203,10 +370,18 @@ final class AppInfoViewModel {
                 )
             }
 
+            let kwPayload: [MetaAnalysisPayload.KeywordEntry] = keywordResults.map { kr in
+                MetaAnalysisPayload.KeywordEntry(
+                    keyword: kr.keyword,
+                    positions: kr.positions,
+                    topTitles: kr.topResults.map { $0.title }
+                )
+            }
+
             do {
                 try Task.checkCancellation()
                 let result = try await openAIService.metaAnalysis(
-                    payload: MetaAnalysisPayload(apps: entriesPayload)
+                    payload: MetaAnalysisPayload(apps: entriesPayload, keywords: kwPayload)
                 )
                 try Task.checkCancellation()
                 metaSummary = result
@@ -221,6 +396,22 @@ final class AppInfoViewModel {
     }
 
     // MARK: - Helpers
+    private func parseKeywords(from raw: String) -> [String] {
+        let separators = CharacterSet(charactersIn: ",\n\t")
+        let tokens = raw.components(separatedBy: separators)
+        var seen = Set<String>()
+        var result: [String] = []
+        for token in tokens {
+            let cleaned = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty else { continue }
+            let key = cleaned.lowercased()
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            result.append(cleaned)
+        }
+        return result
+    }
+
     private func parseAppIDs(from raw: String) -> [String] {
         let separators = CharacterSet(charactersIn: ", \n\t")
         let tokens = raw.components(separatedBy: separators)

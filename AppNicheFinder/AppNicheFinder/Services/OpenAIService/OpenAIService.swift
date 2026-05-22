@@ -33,6 +33,13 @@ protocol OpenAIServicing {
 
 // MARK: - Meta-analysis input
 struct MetaAnalysisPayload {
+    struct KeywordEntry {
+        let keyword: String
+        /// trackId → позиция в выдаче
+        let positions: [Int: Int]
+        /// топ-10 апков на ключе (title, sellerName)
+        let topTitles: [String]
+    }
     struct AppEntry {
         let title: String
         let subtitle: String
@@ -52,6 +59,7 @@ struct MetaAnalysisPayload {
         let description: String
     }
     let apps: [AppEntry]
+    let keywords: [KeywordEntry]
 }
 
 // MARK: - Service
@@ -219,7 +227,15 @@ actor OpenAIService: OpenAIServicing {
         - Что осознанно НЕ делаем на старте (anti-features, чтобы не размывать MVP).
         - План версий: что в v1.0, что добавим в v1.1, v1.2.
 
-        ## 7. Стратегия монетизации
+        ## 7. ASO и позиционирование по ключам
+        Если в инпуте есть блок KEYWORD-АНАЛИЗ:
+        - Перечисли по каким ключам конкуренты сильны (топ-1..10).
+        - Где есть «дыры» — keywords, по которым ни один из анализируемых не в топ-10
+          (можно атаковать).
+        - Какие ключи стоит таргетить в названии / subtitle / keywords-поле нового приложения.
+        - Если KEYWORD-АНАЛИЗ пуст — пропусти эту секцию.
+
+        ## 8. Стратегия монетизации
         Опираясь на цены конкурентов:
         - Рекомендуемая модель (paid / freemium / hybrid).
         - Виды и цены подписок (weekly / monthly / yearly / lifetime) — конкретные цифры в USD.
@@ -231,7 +247,33 @@ actor OpenAIService: OpenAIServicing {
         Опирайся ТОЛЬКО на данные из инпута — не выдумывай факты про конкурентов.
         """
 
-        let userPrompt = "Данные по конкурентам:\n\n\(corpus)"
+        // Keyword block
+        var kwBlock = ""
+        if !payload.keywords.isEmpty {
+            // titleByTrackId: ID → название (для красивого вывода позиций)
+            var titleByID: [Int: String] = [:]
+            for (i, app) in payload.apps.enumerated() {
+                _ = i
+                if let trackId = Int(app.title) { _ = trackId }
+                // нам ID не пробрасывается из AppEntry — используем по имени
+            }
+            kwBlock += "\n=====================================\nKEYWORD-АНАЛИЗ (позиции в App Store search):\n"
+            for kw in payload.keywords {
+                kwBlock += "\n• «\(kw.keyword)»\n"
+                if kw.positions.isEmpty {
+                    kwBlock += "    Анализируемые приложения: не в топ-200\n"
+                } else {
+                    for (id, pos) in kw.positions.sorted(by: { $0.value < $1.value }) {
+                        kwBlock += "    appID=\(id) → позиция \(pos)\n"
+                    }
+                }
+                if !kw.topTitles.isEmpty {
+                    kwBlock += "    ТОП-10 по ключу: \(kw.topTitles.joined(separator: ", "))\n"
+                }
+            }
+        }
+
+        let userPrompt = "Данные по конкурентам:\n\n\(corpus)\(kwBlock)"
         return try await chat(system: systemPrompt, user: userPrompt, temperature: 0.4, maxTokens: 6000)
     }
 

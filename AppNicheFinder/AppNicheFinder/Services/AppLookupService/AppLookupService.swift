@@ -27,6 +27,8 @@ protocol AppLookupServicing {
     func fetchInfo(appID: String, country: String) async throws -> AppInfo
     func fetchBadReviews(appID: String, country: String, maxRating: Int, pages: Int) async throws -> [AppReview]
     func fetchGoodReviews(appID: String, country: String, minRating: Int, limit: Int, pages: Int) async throws -> [AppReview]
+    func searchKeyword(_ keyword: String, country: String, trackedAppIDs: Set<Int>) async throws -> KeywordResult
+    func discoverByKeywords(_ keywords: [String], country: String, perKeywordLimit: Int) async throws -> [DiscoveredApp]
 }
 
 // MARK: - Service (actor — thread-safe networking)
@@ -46,6 +48,144 @@ actor AppLookupService: AppLookupServicing {
         let (parsedSubtitle, parsedIAPs) = await pageData
 
         return makeAppInfo(from: result, subtitle: parsedSubtitle, iaps: parsedIAPs, country: country)
+    }
+
+    // MARK: - Keyword search (iTunes Search API)
+    /// Возвращает результаты поиска по ключу: top-10 видимых + позиции трекаемых приложений.
+    /// iTunes Search API не идентичен реальному порядку в App Store, но даёт хороший прокси.
+    func searchKeyword(_ keyword: String, country: String = "us", trackedAppIDs: Set<Int> = []) async throws -> KeywordResult {
+        let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return KeywordResult(keyword: keyword, topResults: [], positions: [:])
+        }
+
+        var components = URLComponents(string: "https://itunes.apple.com/search")!
+        components.queryItems = [
+            URLQueryItem(name: "term", value: trimmed),
+            URLQueryItem(name: "country", value: country.isEmpty ? "us" : country.lowercased()),
+            URLQueryItem(name: "entity", value: "software"),
+            URLQueryItem(name: "limit", value: "200")
+        ]
+        let request = URLRequest(url: components.url!)
+        NetworkLogger.logRequest(request)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        NetworkLogger.logResponse(response, data: data, requestURL: request.url)
+
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw AppLookupError.badStatusCode(http.statusCode)
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let results = json["results"] as? [[String: Any]]
+        else { return KeywordResult(keyword: trimmed, topResults: [], positions: [:]) }
+
+        var topResults: [KeywordSearchHit] = []
+        var positions: [Int: Int] = [:]
+
+        for (idx, item) in results.enumerated() {
+            let position = idx + 1
+            guard let trackId = item["trackId"] as? Int,
+                  let trackName = item["trackName"] as? String
+            else { continue }
+            if trackedAppIDs.contains(trackId) {
+                positions[trackId] = position
+            }
+            if topResults.count < 10 {
+                let iconStr = (item["artworkUrl100"] as? String) ?? (item["artworkUrl60"] as? String)
+                let hit = KeywordSearchHit(
+                    id: trackId,
+                    position: position,
+                    title: trackName,
+                    sellerName: (item["sellerName"] as? String) ?? "",
+                    iconURL: iconStr.flatMap(URL.init(string:)),
+                    averageRating: (item["averageUserRating"] as? Double) ?? 0,
+                    ratingCount: (item["userRatingCount"] as? Int) ?? 0,
+                    bundleId: (item["bundleId"] as? String) ?? ""
+                )
+                topResults.append(hit)
+            }
+        }
+
+        return KeywordResult(keyword: trimmed, topResults: topResults, positions: positions)
+    }
+
+    // MARK: - Discovery (поиск конкурентов по списку ключей с агрегацией)
+    /// Запускает iTunes Search по каждому keyword (top-perKeywordLimit),
+    /// агрегирует уникальные приложения и записывает на каких ключах нашлись.
+    func discoverByKeywords(_ keywords: [String], country: String = "us", perKeywordLimit: Int = 30) async throws -> [DiscoveredApp] {
+        let countryLower = country.isEmpty ? "us" : country.lowercased()
+        let clean = keywords.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !clean.isEmpty else { return [] }
+
+        // Для каждого keyword дёргаем search и возвращаем (keyword, [items]) — лимит верхушки
+        let perKW = try await withThrowingTaskGroup(of: (String, [[String: Any]]).self) { group -> [String: [[String: Any]]] in
+            for kw in clean {
+                group.addTask { [weak self] in
+                    guard let self else { return (kw, []) }
+                    return (kw, try await self.rawSearchResults(keyword: kw, country: countryLower, limit: perKeywordLimit))
+                }
+            }
+            var dict: [String: [[String: Any]]] = [:]
+            for try await (k, items) in group { dict[k] = items }
+            return dict
+        }
+
+        // Агрегация: trackId → DiscoveredApp (positions накапливаем по всем keyword)
+        var aggregated: [Int: DiscoveredApp] = [:]
+        for kw in clean {
+            guard let items = perKW[kw] else { continue }
+            for (idx, item) in items.enumerated() {
+                guard let trackId = item["trackId"] as? Int,
+                      let trackName = item["trackName"] as? String
+                else { continue }
+                let position = idx + 1
+                if var existing = aggregated[trackId] {
+                    existing.positions[kw] = position
+                    aggregated[trackId] = existing
+                } else {
+                    let iconStr = (item["artworkUrl100"] as? String) ?? (item["artworkUrl60"] as? String)
+                    let app = DiscoveredApp(
+                        id: trackId,
+                        title: trackName,
+                        sellerName: (item["sellerName"] as? String) ?? "",
+                        iconURL: iconStr.flatMap(URL.init(string:)),
+                        averageRating: (item["averageUserRating"] as? Double) ?? 0,
+                        ratingCount: (item["userRatingCount"] as? Int) ?? 0,
+                        bundleId: (item["bundleId"] as? String) ?? "",
+                        positions: [kw: position]
+                    )
+                    aggregated[trackId] = app
+                }
+            }
+        }
+
+        // Сортировка: сначала по числу ключей (больше — выше), потом по лучшей позиции
+        return aggregated.values.sorted { lhs, rhs in
+            if lhs.keywordCount != rhs.keywordCount { return lhs.keywordCount > rhs.keywordCount }
+            return lhs.bestPosition < rhs.bestPosition
+        }
+    }
+
+    /// Низкоуровневая обертка над iTunes Search — возвращает сырые results.
+    private func rawSearchResults(keyword: String, country: String, limit: Int) async throws -> [[String: Any]] {
+        var components = URLComponents(string: "https://itunes.apple.com/search")!
+        components.queryItems = [
+            URLQueryItem(name: "term", value: keyword),
+            URLQueryItem(name: "country", value: country),
+            URLQueryItem(name: "entity", value: "software"),
+            URLQueryItem(name: "limit", value: String(limit))
+        ]
+        let request = URLRequest(url: components.url!)
+        NetworkLogger.logRequest(request)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        NetworkLogger.logResponse(response, data: Data(), requestURL: request.url)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw AppLookupError.badStatusCode(http.statusCode)
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let results = json["results"] as? [[String: Any]] else { return [] }
+        return results
     }
 
     // MARK: - Good reviews (≥ minRating, до limit штук)

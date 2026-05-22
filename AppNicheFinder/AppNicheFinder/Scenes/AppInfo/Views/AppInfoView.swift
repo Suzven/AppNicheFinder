@@ -15,13 +15,22 @@ struct AppInfoView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    inputSection
+                    modePicker
+                    if viewModel.mode == .byIDs {
+                        inputSection
+                    } else {
+                        DiscoveryView(viewModel: viewModel)
+                    }
                     if !viewModel.entries.isEmpty {
                         progressSection
                         ForEach(viewModel.entries) { entry in
-                            AppEntryCardView(entry: entry)
+                            AppEntryCardView(
+                                entry: entry,
+                                keywordPositions: viewModel.keywordPositions(for: entry)
+                            )
                         }
                         if viewModel.allDone && viewModel.hasAnySuccess {
+                            KeywordCheckView(viewModel: viewModel)
                             metaAnalysisSection
                             if !viewModel.metaSummary.isEmpty {
                                 trafficBudgetSection
@@ -50,6 +59,16 @@ struct AppInfoView: View {
                 Button("OK", role: .cancel) {}
             }
         }
+    }
+
+    // MARK: - Mode picker
+    private var modePicker: some View {
+        Picker("Режим", selection: $viewModel.mode) {
+            ForEach(AppInfoViewModel.AnalysisMode.allCases) { mode in
+                Text(mode.rawValue).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
     }
 
     // MARK: - Input
