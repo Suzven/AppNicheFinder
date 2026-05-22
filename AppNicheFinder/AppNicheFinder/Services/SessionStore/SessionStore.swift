@@ -16,7 +16,10 @@ final class SessionStore {
     /// Метаданные сессий (без тяжёлого payload — только для списка).
     private(set) var sessions: [SessionMeta] = []
 
+    @ObservationIgnored
     private let fm = FileManager.default
+
+    @ObservationIgnored
     private lazy var rootURL: URL = {
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
         let dir = docs.appendingPathComponent("sessions", isDirectory: true)
@@ -26,12 +29,14 @@ final class SessionStore {
         return dir
     }()
 
+    @ObservationIgnored
     private let encoder: JSONEncoder = {
         let e = JSONEncoder()
         e.dateEncodingStrategy = .iso8601
         e.outputFormatting = [.prettyPrinted, .sortedKeys]
         return e
     }()
+    @ObservationIgnored
     private let decoder: JSONDecoder = {
         let d = JSONDecoder()
         d.dateDecodingStrategy = .iso8601
