@@ -163,17 +163,7 @@ struct AppInfoView: View {
             .disabled(viewModel.isRunningMeta)
 
             if !viewModel.metaSummary.isEmpty {
-                ScrollView {
-                    Text(viewModel.metaSummary)
-                        .font(.callout)
-                        .textSelection(.enabled)
-                        .multilineTextAlignment(.leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(Color(.tertiarySystemBackground))
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                }
-                .frame(maxHeight: 600)
+                CopyableTextBlock(text: viewModel.metaSummary, maxHeight: 600)
             }
         }
         .padding(14)
@@ -206,17 +196,7 @@ struct AppInfoView: View {
             .disabled(viewModel.isRunningASO)
 
             if !viewModel.asoSummary.isEmpty {
-                ScrollView {
-                    Text(viewModel.asoSummary)
-                        .font(.callout)
-                        .textSelection(.enabled)
-                        .multilineTextAlignment(.leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(Color(.tertiarySystemBackground))
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                }
-                .frame(maxHeight: 700)
+                CopyableTextBlock(text: viewModel.asoSummary, maxHeight: 700)
             }
         }
         .padding(14)
