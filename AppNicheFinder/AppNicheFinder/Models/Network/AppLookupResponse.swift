@@ -40,22 +40,26 @@ struct AppIAP: Identifiable, Hashable {
     let price: Double
     let isSubscription: Bool
 
-    /// Нормализованная годовая стоимость для оценки LTV.
-    /// Weekly → ×52, Monthly → ×12, Yearly → ×1, Lifetime/IAP → как есть.
+    /// Retention-нормализованная стоимость подписки за весь lifetime юзера.
+    /// Опирается на бенчмарки RevenueCat State of Subscription Apps 2025:
+    /// - Weekly:  median retention ~6 недель  → price × 6
+    /// - Monthly: median retention ~4 месяцев → price × 4
+    /// - Yearly:  median retention ~1 год     → price × 1
+    /// Это **реалистичная** LTV-оценка, а не гросс «если бы платил весь год».
     var normalizedYearlyPrice: Double {
         let n = name.lowercased()
         if isSubscription {
             if n.contains("week") || n.contains("недел") || n.contains("еженедел") {
-                return price * 52
+                return price * 6
             }
             if n.contains("month") || n.contains("ежемес") || n.contains("месяч") {
-                return price * 12
+                return price * 4
             }
             if n.contains("year") || n.contains("annual") || n.contains("годов") || n.contains("ежегод") {
                 return price
             }
-            // По умолчанию для подписки — месячная (самый частый дефолт)
-            return price * 12
+            // По умолчанию для подписки — считаем как monthly (× 4)
+            return price * 4
         }
         // Одноразовая покупка — берем как есть (платится один раз за lifetime)
         return price
@@ -102,6 +106,7 @@ struct AppInfo: Identifiable, Hashable {
 
     /// Конверсия в платящего юзера (freemium baseline 3%, sensitivity 2% / 5%).
     private static let payingRateMin: Double = 0.02
+    private static let payingRateMid: Double = 0.03
     private static let payingRateMax: Double = 0.05
 
     var isPaid: Bool { price > 0 }
@@ -118,6 +123,14 @@ struct AppInfo: Identifiable, Hashable {
         iaps.map(\.normalizedYearlyPrice).filter { $0 > 0 }.max() ?? 0
     }
 
+    /// Медианная цена IAP — используется для среднего сценария.
+    var medianYearlyIAPPrice: Double {
+        let values = iaps.map(\.normalizedYearlyPrice).filter { $0 > 0 }.sorted()
+        guard !values.isEmpty else { return 0 }
+        let mid = values.count / 2
+        return values.count % 2 == 0 ? (values[mid - 1] + values[mid]) / 2 : values[mid]
+    }
+
     // MARK: - Final revenue range (USD, lifetime)
     /// Минимальная оценка дохода — нижняя установка × минимальный план × нижняя конверсия.
     var revenueMin: Double {
@@ -128,6 +141,17 @@ struct AppInfo: Identifiable, Hashable {
             return Double(installEstimateLow) * AppInfo.payingRateMin * minYearlyIAPPrice * AppInfo.developerShare
         }
         return Double(installEstimateLow) * AppInfo.ltvNoIapMin
+    }
+
+    /// Средний сценарий — все mid-параметры. Используется для расчёта LTV/install.
+    var revenueMid: Double {
+        if isPaid {
+            return Double(installEstimateMid) * price * AppInfo.developerShare
+        }
+        if hasIAPs {
+            return Double(installEstimateMid) * AppInfo.payingRateMid * medianYearlyIAPPrice * AppInfo.developerShare
+        }
+        return Double(installEstimateMid) * ((AppInfo.ltvNoIapMin + AppInfo.ltvNoIapMax) / 2)
     }
 
     /// Максимальная оценка дохода — верхняя установка × максимальный план × верхняя конверсия.

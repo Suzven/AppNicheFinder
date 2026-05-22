@@ -65,7 +65,7 @@ struct TrafficBudgetView: View {
                 metric("Целевой LTV/install", String(format: "$%.2f", targetLTV))
                 metric("Install→Paying", String(format: "%.1f%%", payingConv * 100))
             }
-            Text("LTV/install — медиана по проанализированным конкурентам (доход / установки). Install→Paying = install→trial (10%) × trial→paid (40%) по бенчмарку RevenueCat.")
+            Text("LTV/install = revenueMid ÷ installsMid (медиана по конкурентам), с потолком $8 для реализма. Install→Paying = install→trial (10%) × trial→paid (40%) (RevenueCat 2025).")
                 .font(.caption2).foregroundStyle(.secondary)
 
             Divider()
@@ -158,20 +158,23 @@ struct TrafficBudgetView: View {
     }
 
     /// Медианный доход на установку по конкурентам.
+    /// Считается по mid-сценарию (revenueMid / installsMid), чтобы числитель
+    /// и знаменатель были в одном уровне допущений.
+    /// Применяется sanity-cap $8 — выше LTV в индустрии редко встречается даже для топов.
     private func computeTargetLTV() -> Double {
         let successful = entries.compactMap { $0.info }
         guard !successful.isEmpty else { return 0 }
         let perInstall = successful.compactMap { info -> Double? in
-            let midRev = (info.revenueMin + info.revenueMax) / 2
             let installs = Double(info.installEstimateMid)
             guard installs > 0 else { return nil }
-            return midRev / installs
+            return info.revenueMid / installs
         }
         guard !perInstall.isEmpty else { return 0 }
-        // медиана
         let sorted = perInstall.sorted()
         let mid = sorted.count / 2
-        return sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+        let median = sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+        // sanity-cap: $8 — потолок реалистичного среднего LTV/install в массовых нишах
+        return min(median, 8.0)
     }
 
     private func money(_ value: Double) -> String {
