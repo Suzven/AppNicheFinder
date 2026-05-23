@@ -18,6 +18,9 @@ struct AppEntryCardView: View {
             }
             if let info = entry.info {
                 shortMetrics(info)
+                if !info.screenshotURLs.isEmpty {
+                    screenshotsRow(info.screenshotURLs)
+                }
                 if isExpanded { fullDetails(info) }
                 Button {
                     withAnimation { isExpanded.toggle() }
@@ -71,6 +74,29 @@ struct AppEntryCardView: View {
             Text(entry.statusLabel)
                 .font(.caption)
                 .foregroundStyle(entry.isFailed ? .red : .secondary)
+        }
+    }
+
+    // MARK: - Screenshots row
+    private func screenshotsRow(_ urls: [URL]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(urls, id: \.absoluteString) { url in
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image.resizable().scaledToFit()
+                        case .failure:
+                            Color(.tertiarySystemFill).overlay(Image(systemName: "photo"))
+                        default:
+                            Color(.tertiarySystemFill).overlay(ProgressView().scaleEffect(0.7))
+                        }
+                    }
+                    .frame(height: 240)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .padding(.vertical, 2)
         }
     }
 

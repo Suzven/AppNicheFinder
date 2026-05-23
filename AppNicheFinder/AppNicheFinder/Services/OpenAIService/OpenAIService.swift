@@ -30,6 +30,19 @@ protocol OpenAIServicing {
     func summarizePraise(appTitle: String, reviews: [AppReview]) async throws -> String
     func metaAnalysis(payload: MetaAnalysisPayload) async throws -> String
     func asoAnalysis(payload: ASOAnalysisPayload) async throws -> String
+    func analyzeVisuals(payload: VisualAnalysisPayload) async throws -> String
+}
+
+// MARK: - Visual analysis input
+struct VisualAnalysisPayload {
+    struct AppVisual {
+        let title: String
+        let ratingsCount: Int
+        let averageRating: Double
+        let iconURL: URL?
+        let screenshotURLs: [URL]   // первые 4
+    }
+    let apps: [AppVisual]
 }
 
 // MARK: - ASO analysis input
@@ -180,8 +193,6 @@ actor OpenAIService: OpenAIServicing {
             Subtitle: \(app.subtitle.isEmpty ? "—" : app.subtitle)
             Категория: \(app.genre)
             Оценка: \(String(format: "%.2f", app.averageRating)) (\(app.ratingsCount) оценок)
-            Примерные установки: \(app.installsEstimate)
-            Доход (lifetime USD): $\(Int(app.revenueMinUSD)) – $\(Int(app.revenueMaxUSD))
             Монетизация: \(app.isPaid ? "Платное \(app.formattedPrice)" : "Free / Freemium")
             АКТИВНОСТЬ: первый релиз \(firstRelease) (возраст \(ageYears)), последнее обновление \(lastUpdate) (\(daysSinceUpdate))
             IAP:
@@ -263,7 +274,6 @@ actor OpenAIService: OpenAIServicing {
         - Виды и цены подписок (weekly / monthly / yearly / lifetime) — конкретные цифры в USD.
           Поясни почему (медиана конкурентов, anchor pricing, ladder).
         - Trial / hard paywall / soft paywall — что лучше для этой ниши.
-        - Целевой ARPU и LTV — конкретные цифры.
 
         Будь конкретен. Числа давай конкретные. Не пиши очевидных банальностей.
         Опирайся ТОЛЬКО на данные из инпута — не выдумывай факты про конкурентов.
@@ -483,6 +493,121 @@ actor OpenAIService: OpenAIServicing {
         """
 
         return try await chat(system: systemPrompt, user: userPrompt, temperature: 0.4, maxTokens: 12000)
+    }
+
+    // MARK: - Visual analysis (GPT-4o Vision API)
+    func analyzeVisuals(payload: VisualAnalysisPayload) async throws -> String {
+        guard !payload.apps.isEmpty else { throw OpenAIError.noReviews }
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { throw OpenAIError.missingKey }
+
+        let systemPrompt = """
+        Ты — senior ASO-эксперт и UX/visual-дизайнер с экспертизой по App Store творчеству.
+        Тебе показывают иконку и первые 4 скриншота нескольких приложений из одной ниши.
+        К каждому приложению приложено название и кол-во оценок (proxy популярности).
+
+        Проанализируй ВИЗУАЛЬНУЮ КОНКУРЕНЦИЮ детально:
+
+        ## 1. Иконки конкурентов
+        - У каждого опиши: основной цвет, центральный объект/символ, стиль (flat / gradient / 3D / illustration / photo).
+        - Найди ОБЩИЕ паттерны (что повторяется у топовых = индустриальный стандарт ниши).
+        - Найди отличающихся (кто решил выделиться) — работает ли это для них (по числу оценок).
+        - Какую иконку рекомендовать новому приложению (конкретно: цвет, символ, стиль).
+
+        ## 2. Скриншоты — паттерны успешных
+        Для каждого приложения:
+        - Первый скриншот: hero / feature-showcase / paywall? Заголовок?
+        - 2-4 скриншоты: что показывают, в каком порядке.
+        - Текст: размер, цвет, шрифт (sans-serif bold? handwritten?), сколько слов.
+        - Фон: solid color / gradient / photo / blurred screenshot.
+        - Композиция: device mockup / full screen / split-screen.
+
+        ## 3. Сводные паттерны лидеров
+        Отсортируй приложения от наибольшего числа оценок к наименьшему. У топ-2 найди:
+        - Общую цветовую гамму (например, «зелёный + белый + акценты оранжевым»).
+        - Шрифты и размер текста на 1-м скрине.
+        - Тематические сцены (что они показывают — процесс использования? результат? before/after?).
+        - Что они НЕ делают (например, не показывают paywall в первых 4).
+
+        ## 4. Конкретные рекомендации для нового приложения
+        - Цветовая палитра (3 hex-кода).
+        - Стиль 1-го скриншота: что должно быть на нём для максимальной конверсии.
+        - Структура 4 скриншотов: что показать и в каком порядке.
+        - Текст на скриншотах: тон, длина, главные слова (опираясь на keywords ниши).
+        - Чем отличиться от конкурентов, не теряя «узнаваемость ниши».
+
+        Будь конкретен, описывай детали визуально (цвета, расположение, текстура). На русском.
+        """
+
+        // Сборка multi-modal сообщения: текстовая преамбула + изображения
+        var contentBlocks: [[String: Any]] = []
+        var preamble = "Анализируй \(payload.apps.count) конкурентов в одной нише.\n\n"
+        for (i, app) in payload.apps.enumerated() {
+            preamble += "ПРИЛОЖЕНИЕ #\(i + 1): \(app.title)\n"
+            preamble += "Оценка: \(String(format: "%.2f", app.averageRating)) (\(app.ratingsCount) оценок)\n\n"
+        }
+        contentBlocks.append(["type": "text", "text": preamble])
+
+        for (i, app) in payload.apps.enumerated() {
+            contentBlocks.append(["type": "text", "text": "--- ПРИЛОЖЕНИЕ #\(i + 1): \(app.title) ---"])
+            if let icon = app.iconURL {
+                contentBlocks.append([
+                    "type": "text", "text": "Иконка:"
+                ])
+                contentBlocks.append([
+                    "type": "image_url",
+                    "image_url": ["url": icon.absoluteString, "detail": "low"]
+                ])
+            }
+            if !app.screenshotURLs.isEmpty {
+                contentBlocks.append(["type": "text", "text": "Скриншоты (первые \(app.screenshotURLs.count)):"])
+                for url in app.screenshotURLs {
+                    contentBlocks.append([
+                        "type": "image_url",
+                        "image_url": ["url": url.absoluteString, "detail": "low"]
+                    ])
+                }
+            }
+        }
+
+        let body: [String: Any] = [
+            "model": "gpt-4o",
+            "temperature": 0.4,
+            "max_tokens": 4000,
+            "messages": [
+                ["role": "system", "content": systemPrompt],
+                ["role": "user",   "content": contentBlocks]
+            ]
+        ]
+
+        guard let payloadData = try? JSONSerialization.data(withJSONObject: body) else {
+            throw OpenAIError.invalidPayload
+        }
+
+        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 180
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.httpBody = payloadData
+
+        NetworkLogger.logRequest(request)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        NetworkLogger.logResponse(response, data: data, requestURL: request.url)
+
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw OpenAIError.badStatusCode(http.statusCode, raw)
+        }
+        guard
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let choices = json["choices"] as? [[String: Any]],
+            let first = choices.first,
+            let message = first["message"] as? [String: Any],
+            let content = message["content"] as? String,
+            !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { throw OpenAIError.emptyResponse }
+        return content.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Helpers

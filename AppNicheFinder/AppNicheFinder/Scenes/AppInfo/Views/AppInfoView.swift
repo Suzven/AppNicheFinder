@@ -36,7 +36,6 @@ struct AppInfoView: View {
                             metaAnalysisSection
                             if !viewModel.metaSummary.isEmpty {
                                 asoAnalysisSection
-                                trafficBudgetSection
                             }
                         }
                     }
@@ -168,19 +167,46 @@ struct AppInfoView: View {
             }
             Text("Сведёт жалобы и плюсы по всем приложениям, подскажет идею продукта, рекомендуемые цены подписок и стратегию запуска.")
                 .font(.caption).foregroundStyle(.secondary)
-            Button {
-                viewModel.runMetaAnalysis()
-            } label: {
-                Label(viewModel.metaSummary.isEmpty ? "Summarize All" : "Перегенерировать",
-                      systemImage: "wand.and.stars")
+
+            HStack(spacing: 8) {
+                Button {
+                    viewModel.runMetaAnalysis()
+                } label: {
+                    Label(viewModel.metaSummary.isEmpty ? "Summarize All" : "Перегенерировать",
+                          systemImage: "wand.and.stars")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(viewModel.isRunningMeta)
+
+                Button {
+                    viewModel.runVisualsAnalysis()
+                } label: {
+                    HStack(spacing: 6) {
+                        if viewModel.isRunningVisuals {
+                            ProgressView().scaleEffect(0.7)
+                        } else {
+                            Image(systemName: "photo.stack")
+                        }
+                        Text(viewModel.visualsSummary.isEmpty ? "Аналитика графики" : "Перегенерировать")
+                            .lineLimit(1)
+                    }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 8)
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.isRunningVisuals)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(viewModel.isRunningMeta)
 
             if !viewModel.metaSummary.isEmpty {
                 CopyableTextBlock(text: viewModel.metaSummary, maxHeight: 600)
+            }
+
+            if !viewModel.visualsSummary.isEmpty {
+                Divider()
+                Text("Аналитика визуала").font(.subheadline.bold())
+                CopyableTextBlock(text: viewModel.visualsSummary, maxHeight: 500)
             }
         }
         .padding(14)
@@ -221,10 +247,6 @@ struct AppInfoView: View {
         .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
-    // MARK: - Traffic budget (показываем после meta-summary)
-    private var trafficBudgetSection: some View {
-        TrafficBudgetView(entries: viewModel.entries)
-    }
 }
 
 #Preview {

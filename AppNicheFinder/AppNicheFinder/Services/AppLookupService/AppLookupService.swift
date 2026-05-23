@@ -368,7 +368,8 @@ actor AppLookupService: AppLookupServicing {
             price: r.price ?? 0,
             formattedPrice: r.formattedPrice ?? (r.price == 0 ? "Free" : ""),
             currency: r.currency ?? "USD",
-            iaps: iaps
+            iaps: iaps,
+            screenshotURLs: (r.screenshotUrls ?? []).compactMap(URL.init(string:))
         )
     }
 

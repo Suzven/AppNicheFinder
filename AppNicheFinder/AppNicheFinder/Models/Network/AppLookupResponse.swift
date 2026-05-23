@@ -30,6 +30,8 @@ struct AppLookupResult: Decodable {
     let price: Double?
     let formattedPrice: String?
     let currency: String?
+    let screenshotUrls: [String]?
+    let ipadScreenshotUrls: [String]?
 }
 
 // MARK: - In-App Purchase model (parsed from apps.apple.com)
@@ -86,6 +88,7 @@ struct AppInfo: Identifiable, Hashable {
     let formattedPrice: String // "Free", "$4.99" и т.д.
     let currency: String       // "USD"
     let iaps: [AppIAP]         // покупки и подписки внутри приложения
+    let screenshotURLs: [URL]  // iPhone-скриншоты со страницы App Store
 
     // MARK: - Estimated installs (very rough — based on review-rate benchmarks)
     /// Industry rule-of-thumb conversion rates of active users → ratings.

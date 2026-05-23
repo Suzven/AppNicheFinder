@@ -41,6 +41,10 @@ final class AppInfoViewModel {
     var asoSummary: String = ""
     var isRunningASO: Bool = false
 
+    // MARK: - Visual analysis state
+    var visualsSummary: String = ""
+    var isRunningVisuals: Bool = false
+
     // MARK: - Keyword search state
     var keywordsInput: String = ""
     var keywordResults: [KeywordResult] = []
@@ -72,6 +76,8 @@ final class AppInfoViewModel {
     private var discoveryTask: Task<Void, Never>?
     @ObservationIgnored
     private var asoTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var visualsTask: Task<Void, Never>?
 
     // MARK: - Init
     init(appLookupService: AppLookupServicing, openAIService: OpenAIServicing) {
@@ -122,6 +128,7 @@ final class AppInfoViewModel {
         entries = ids.map { AppEntry(appID: $0, country: countryLower) }
         metaSummary = ""
         asoSummary = ""
+        visualsSummary = ""
         // Новый набор приложений → начинаем новую сессию
         currentSessionID = nil
         currentSessionName = ""
@@ -137,11 +144,13 @@ final class AppInfoViewModel {
         keywordsTask?.cancel()
         discoveryTask?.cancel()
         asoTask?.cancel()
+        visualsTask?.cancel()
         orchestratorTask = nil
         metaTask = nil
         keywordsTask = nil
         discoveryTask = nil
         asoTask = nil
+        visualsTask = nil
     }
 
     func reset() {
@@ -149,6 +158,7 @@ final class AppInfoViewModel {
         entries = []
         metaSummary = ""
         asoSummary = ""
+        visualsSummary = ""
         appIDsInput = ""
         discoveryKeywordsInput = ""
         discoveredApps = []
@@ -486,6 +496,44 @@ final class AppInfoViewModel {
         }
     }
 
+    // MARK: - Visual analysis
+    func runVisualsAnalysis() {
+        guard hasAnySuccess else { return }
+        visualsTask?.cancel()
+        visualsTask = Task { [weak self] in
+            guard let self else { return }
+            isRunningVisuals = true
+            visualsSummary = ""
+
+            let visuals: [VisualAnalysisPayload.AppVisual] = entries.compactMap { entry in
+                guard let info = entry.info, entry.isDone else { return nil }
+                return VisualAnalysisPayload.AppVisual(
+                    title: info.title,
+                    ratingsCount: info.ratingsCountTotal,
+                    averageRating: info.averageRating,
+                    iconURL: info.iconURL,
+                    screenshotURLs: Array(info.screenshotURLs.prefix(4))
+                )
+            }
+
+            do {
+                try Task.checkCancellation()
+                let result = try await openAIService.analyzeVisuals(
+                    payload: VisualAnalysisPayload(apps: visuals)
+                )
+                try Task.checkCancellation()
+                visualsSummary = result
+                saveCurrentSession()
+            } catch is CancellationError {
+                // ignore
+            } catch {
+                alertMessage = "\(error.localizedDescription)"
+                isShowAlert = true
+            }
+            isRunningVisuals = false
+        }
+    }
+
     // MARK: - Session persistence
     /// Сохраняет текущее состояние как сессию. Если сессия уже была загружена/создана —
     /// обновляет её, иначе создаёт новую.
@@ -511,7 +559,8 @@ final class AppInfoViewModel {
             discoveredApps: discoveredApps.map { $0.toDTO() },
             keywordResults: keywordResults.map { $0.toDTO() },
             metaSummary: metaSummary,
-            asoSummary: asoSummary
+            asoSummary: asoSummary,
+            visualsSummary: visualsSummary
         )
 
         // Сохраняем createdAt от исходной версии, если есть
@@ -543,6 +592,7 @@ final class AppInfoViewModel {
         keywordResults = session.keywordResults.map(KeywordResult.init)
         metaSummary = session.metaSummary
         asoSummary = session.asoSummary
+        visualsSummary = session.visualsSummary ?? ""
 
         // последний снимок исследованных keyword-ов
         lastDiscoveryKeywords = Array(Set(discoveredApps.flatMap { $0.positions.keys })).sorted()

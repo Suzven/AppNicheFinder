@@ -28,6 +28,7 @@ struct AnalysisSession: Identifiable, Codable, Hashable {
 
     var metaSummary: String
     var asoSummary: String
+    var visualsSummary: String?
 
     /// Краткое summary для списка сессий: первые 3 названия приложений.
     var subtitle: String {
@@ -68,6 +69,7 @@ struct AppInfoDTO: Codable, Hashable {
     let formattedPrice: String
     let currency: String
     let iaps: [AppIAPDTO]
+    let screenshotURLs: [URL]
 }
 
 struct AppIAPDTO: Codable, Hashable {
@@ -157,7 +159,8 @@ extension AppInfo {
             price: dto.price,
             formattedPrice: dto.formattedPrice,
             currency: dto.currency,
-            iaps: dto.iaps.map(AppIAP.init)
+            iaps: dto.iaps.map(AppIAP.init),
+            screenshotURLs: dto.screenshotURLs
         )
     }
     func toDTO() -> AppInfoDTO {
@@ -168,7 +171,8 @@ extension AppInfo {
             lastUpdateDate: lastUpdateDate, iconURL: iconURL, storeURL: storeURL,
             sellerName: sellerName, primaryGenre: primaryGenre, version: version,
             price: price, formattedPrice: formattedPrice, currency: currency,
-            iaps: iaps.map { $0.toDTO() }
+            iaps: iaps.map { $0.toDTO() },
+            screenshotURLs: screenshotURLs
         )
     }
 }
