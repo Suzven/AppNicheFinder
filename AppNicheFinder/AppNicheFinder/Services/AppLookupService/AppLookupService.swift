@@ -369,8 +369,27 @@ actor AppLookupService: AppLookupServicing {
             formattedPrice: r.formattedPrice ?? (r.price == 0 ? "Free" : ""),
             currency: r.currency ?? "USD",
             iaps: iaps,
-            screenshotURLs: (r.screenshotUrls ?? []).compactMap(URL.init(string:))
+            screenshotURLs: Self.bestScreenshots(iphone: r.screenshotUrls, ipad: r.ipadScreenshotUrls)
         )
+    }
+
+    /// Apple отдает разные поля для iPhone / iPad / Mac. Берём первое непустое:
+    /// сначала iPhone (это «канон»), если пусто — iPad (часто заполнен у универсальных или iPad-first).
+    private static func bestScreenshots(iphone: [String]?, ipad: [String]?) -> [URL] {
+        let iphoneCount = (iphone ?? []).count
+        let ipadCount   = (ipad ?? []).count
+        let iphoneURLs = (iphone ?? []).compactMap(URL.init(string:))
+        if !iphoneURLs.isEmpty {
+            print("📸 Screenshots: iPhone=\(iphoneCount), iPad=\(ipadCount) → using iPhone")
+            return iphoneURLs
+        }
+        let ipadURLs = (ipad ?? []).compactMap(URL.init(string:))
+        if !ipadURLs.isEmpty {
+            print("📸 Screenshots: iPhone=0, iPad=\(ipadCount) → falling back to iPad")
+            return ipadURLs
+        }
+        print("📸 Screenshots: оба пусты — у приложения нет iPhone/iPad-скриншотов в Lookup-ответе")
+        return []
     }
 
     // MARK: - Helpers
